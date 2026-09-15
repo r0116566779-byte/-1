@@ -1,0 +1,3312 @@
+from fbchat_muqit import Client, Message
+import re
+import random
+import asyncio
+import json
+import os
+import time
+from collections import deque
+from datetime import datetime
+from gtts import gTTS
+import aiohttp
+from io import BytesIO
+
+
+
+try:
+    import yt_dlp
+    YTDLP_AVAILABLE = True
+except ImportError:
+    YTDLP_AVAILABLE = False
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    ARABIC_SUPPORT = True
+except ImportError:
+    ARABIC_SUPPORT = False
+
+# ==================== الإعدادات ====================
+client = Client(cookies_file_path="cookies.json")
+
+# ==================== تهدئة تلقائية (Rate Limiting + محاكاة سلوك بشري) ====================
+# بتحد من عدد الرسايل اللي البوت بيبعتها في فترة زمنية معينة، وبتضيف تأخير
+# عشوائي شبه طبيعي قبل كل رسالة (زي وقت الكتابة الحقيقي)، عشان تقلل خطر إن
+# فيسبوك يلاحظ نمط سلوك آلي ثابت (رد فوري كل مرة، بفاصل زمني منتظم تمامًا)
+# ويوقف الحساب. بتشتغل تلقائيًا على أي send_message في أي مكان في الكود
+# من غير ما نحتاج نلمس كل استدعاء لوحده.
+RATE_LIMIT_MAX_MESSAGES = 15
+RATE_LIMIT_WINDOW_SECONDS = 60
+_send_timestamps = deque()
+_original_send_message = client.send_message
+
+def _estimate_human_delay(text):
+    """بيحسب تأخير شبه واقعي بناءً على طول النص، زي وقت كتابة شخص حقيقي تقريبًا"""
+    if not text:
+        return random.uniform(0.4, 1.0)
+    chars_per_second = random.uniform(8, 14)  # سرعة كتابة معقولة ومتغيرة
+    delay = len(str(text)) / chars_per_second
+    return min(max(delay, 0.6), 6.0)
+
+async def _rate_limited_send_message(*args, **kwargs):
+    now = time.time()
+    while _send_timestamps and now - _send_timestamps[0] > RATE_LIMIT_WINDOW_SECONDS:
+        _send_timestamps.popleft()
+    if len(_send_timestamps) >= RATE_LIMIT_MAX_MESSAGES:
+        wait_time = RATE_LIMIT_WINDOW_SECONDS - (now - _send_timestamps[0]) + random.uniform(1.0, 4.0)
+        print(f"⏳ تهدئة تلقائية: البوت بعت رسايل كتير بسرعة، مستنيين {wait_time:.1f} ثانية...")
+        await asyncio.sleep(max(wait_time, 0))
+
+    # تأخير شبه بشري قبل كل رسالة (مش رد فوري بالمللي ثانية زي بوت واضح)
+    text_arg = args[0] if args else kwargs.get("text", "")
+    await asyncio.sleep(_estimate_human_delay(text_arg))
+
+    _send_timestamps.append(time.time())
+    return await _original_send_message(*args, **kwargs)
+
+client.send_message = _rate_limited_send_message
+
+DEV_NAME = "إلامہٰ۫۬بہٰ۫۬رآطہٰ۫۬ور ۦٰ "
+DEV_PROFILE_URL = "https://www.facebook.com/profile.php?id=100068218770438"
+DEV_ID = "100068218770438"
+BOT_NAME = "سمسمي 🤖"
+
+USERS_FILE = "users_data.json"
+
+# آخر رسالة في كل محادثة (للتعلم التلقائي)
+# thread_id -> {"text": "...", "sender_id": "..."}
+SEASON_FILE = "season_data.json"
+
+# ==================== تحميل البيانات ====================
+if os.path.exists(USERS_FILE):
+    with open(USERS_FILE, "r", encoding="utf-8") as f:
+        users_data = json.load(f)
+else:
+    users_data = {}
+
+if os.path.exists(SEASON_FILE):
+    with open(SEASON_FILE, "r", encoding="utf-8") as f:
+        season_data = json.load(f)
+else:
+    season_data = {}
+
+# رسائل قائمة المتجر (عشان نعرف نتعرف على ردود الشراء) وحالات لعبة الحرب المعلّقة
+shop_message_ids = set()
+
+# مزادات نشطة (سوق تبادل بين الأعضاء) — thread_id -> بيانات المزاد
+active_auctions = {}
+_season_watcher_started = False
+
+
+
+# ==================== دوال مساعدة للردود ====================
+def _msg_id(sent):
+    """بيستخرج معرف الرسالة سواء كانت str أو كائن Message"""
+    if sent is None:
+        return None
+    if isinstance(sent, str):
+        return sent
+    return getattr(sent, 'id', None)
+
+# ==================== الدوال المساعدة ====================
+def save_users():
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(users_data, f, ensure_ascii=False, indent=2)
+
+def save_season():
+    with open(SEASON_FILE, "w", encoding="utf-8") as f:
+        json.dump(season_data, f, ensure_ascii=False, indent=2)
+
+
+
+def get_user(user_id, name=""):
+    user_id = str(user_id)
+    if user_id not in users_data:
+        users_data[user_id] = {
+            "name": name, "balance": 500, "games_played": 0,
+            "wins": 0, "losses": 0, "total_earned": 0,
+            "total_lost": 0, "warnings": 0, "last_daily": "",
+            "xp": 0, "title": "",
+        }
+        save_users()
+    if name and name != "مستخدم" and users_data[user_id]["name"] != name:
+        users_data[user_id]["name"] = name
+        save_users()
+    # توافق مع مستخدمين قدامى ما عندهمش الحقول الجديدة
+    users_data[user_id].setdefault("xp", 0)
+    users_data[user_id].setdefault("title", "")
+    users_data[user_id].setdefault("xp_boost_until", 0)
+    users_data[user_id].setdefault("prize_boost_until", 0)
+    users_data[user_id].setdefault("memory_notes", [])
+    users_data[user_id].setdefault("season_points", 0)
+    return users_data[user_id]
+
+def add_balance(user_id, amount):
+    user = get_user(user_id)
+    if amount > 0 and time.time() < user.get("prize_boost_until", 0):
+        amount *= 2
+    user["balance"] += amount
+    if amount > 0:
+        user["total_earned"] += amount
+        user["season_points"] = user.get("season_points", 0) + amount
+    else:
+        user["total_lost"] += abs(amount)
+    save_users()
+    return user["balance"]
+
+def add_xp(user_id, amount):
+    user = get_user(user_id)
+    if time.time() < user.get("xp_boost_until", 0):
+        amount *= 2
+    user["xp"] = user.get("xp", 0) + amount
+    save_users()
+    return user["xp"]
+
+def get_level(xp):
+    return (xp // 100) + 1
+
+def get_level_progress(xp):
+    level = get_level(xp)
+    current_floor = (level - 1) * 100
+    into_level = xp - current_floor
+    return level, into_level, 100
+
+def render_arabic(text):
+    """يظبط اتجاه وشكل النص العربي عشان يترسم صح في الصور (لو المكتبات متاحة)"""
+    if ARABIC_SUPPORT and text:
+        try:
+            reshaped = arabic_reshaper.reshape(text)
+            return get_display(reshaped)
+        except Exception:
+            return text
+
+def _vertical_gradient(size, top_color, bottom_color):
+    W, H = size
+    base = Image.new("RGB", size, top_color)
+    top = Image.new("RGB", size, bottom_color)
+    mask = Image.new("L", size)
+    mask_data = []
+    for y in range(H):
+        mask_data.extend([int(255 * (y / H))] * W)
+    mask.putdata(mask_data)
+    base.paste(top, (0, 0), mask)
+    return base
+
+def _rounded_rect(draw, box, radius, **kwargs):
+    """رسم مستطيل بحواف دائرية، مع دعم احتياطي لو النسخة القديمة من Pillow متدعمش rounded_rectangle"""
+    try:
+        draw.rounded_rectangle(box, radius=radius, **kwargs)
+    except AttributeError:
+        draw.rectangle(box, **kwargs)
+
+def generate_profile_card(user_data_dict, full_name):
+    """بيرسم بطاقة صورة عصرية فيها إحصائيات الحساب، بيرجع bytes الصورة أو None لو PIL مش متاحة أو مفيش خط عربي"""
+    if not PIL_AVAILABLE:
+        return None
+    try:
+        W, H = 1000, 560
+
+        # ====== البحث عن خط عربي ======
+        # ندور على خطوط عربية شائعة على Linux
+        arabic_font_candidates = [
+            # Noto Arabic (أشهر خط عربي على Linux)
+            "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansArabic-Bold.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansArabic-Regular.ttf",
+            # Amiri (خط عربي كلاسيكي)
+            "/usr/share/fonts/truetype/amiri/Amiri-Bold.ttf",
+            "/usr/share/fonts/truetype/amiri/Amiri-Regular.ttf",
+            # Cairo
+            "/usr/share/fonts/truetype/cairo/Cairo-Bold.ttf",
+            "/usr/share/fonts/truetype/cairo/Cairo-Regular.ttf",
+            # Kacst
+            "/usr/share/fonts/truetype/kacst/KacstBold.ttf",
+            "/usr/share/fonts/truetype/kacst/KacstRegular.ttf",
+            # FreeFont (بيدعم العربي شوية)
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        ]
+
+        arabic_font_path = None
+        for fp in arabic_font_candidates:
+            if os.path.exists(fp):
+                arabic_font_path = fp
+                break
+
+        # لو مفيش ولا خط عربي — نرجع None (مش هنرسم صورة)
+        if not arabic_font_path:
+            print("⚠️ مفيش خط عربي على السيرفر. البطاقة مش هتتبعت.")
+            return None
+
+        # الخطوط
+        try:
+            font_name = ImageFont.truetype(arabic_font_path, 42)
+            font_title = ImageFont.truetype(arabic_font_path, 24)
+            font_level_num = ImageFont.truetype(arabic_font_path, 40)
+            font_level_lbl = ImageFont.truetype(arabic_font_path, 16)
+            font_stat_val = ImageFont.truetype(arabic_font_path, 30)
+            font_stat_lbl = ImageFont.truetype(arabic_font_path, 18)
+            font_xp = ImageFont.truetype(arabic_font_path, 18)
+        except Exception:
+            return None
+
+        # خلفية متدرجة (بنفسجي غامق -> كحلي غامق)
+        img = _vertical_gradient((W, H), (35, 20, 60), (15, 15, 35)).convert("RGBA")
+        draw = ImageDraw.Draw(img, "RGBA")
+
+        # لوحة البطاقة الرئيسية بحواف دائرية وشفافية خفيفة
+        card_margin = 30
+        _rounded_rect(
+            draw, [card_margin, card_margin, W - card_margin, H - card_margin],
+            radius=28, fill=(255, 255, 255, 18), outline=(255, 255, 255, 60), width=2
+        )
+
+        xp = user_data_dict.get("xp", 0)
+        level = get_level(xp)
+        _, into_level, needed = get_level_progress(xp)
+        balance = user_data_dict.get("balance", 0)
+        title = user_data_dict.get("title") or "بدون لقب"
+        wins = user_data_dict.get("wins", 0)
+        losses = user_data_dict.get("losses", 0)
+
+        # أفاتار دائري بسيط بحرف أول الاسم
+        avatar_cx, avatar_cy, avatar_r = 110, 130, 55
+        _rounded_rect(
+            draw, [avatar_cx - avatar_r, avatar_cy - avatar_r, avatar_cx + avatar_r, avatar_cy + avatar_r],
+            radius=avatar_r, fill=(120, 80, 220, 255)
+        )
+        initial = (full_name.strip()[:1] or "?").upper()
+        iw = draw.textlength(initial, font=font_name)
+        draw.text((avatar_cx - iw / 2, avatar_cy - 26), initial, font=font_name, fill=(255, 255, 255))
+
+        # الاسم واللقب جنب الأفاتار
+        name_x = avatar_cx + avatar_r + 30
+        draw.text((name_x, 90), render_arabic(full_name), font=font_name, fill=(255, 255, 255))
+        draw.text((name_x, 145), render_arabic(title), font=font_title, fill=(200, 175, 255))
+
+        # شارة المستوى (دائرة) أعلى اليمين
+        badge_cx, badge_cy, badge_r = W - 130, 130, 60
+        _rounded_rect(
+            draw, [badge_cx - badge_r, badge_cy - badge_r, badge_cx + badge_r, badge_cy + badge_r],
+            radius=badge_r, fill=(255, 200, 60, 255)
+        )
+        level_txt = str(level)
+        lw = draw.textlength(level_txt, font=font_level_num)
+        draw.text((badge_cx - lw / 2, badge_cy - 32), level_txt, font=font_level_num, fill=(40, 30, 10))
+        lbl_w = draw.textlength("LEVEL", font=font_level_lbl)
+        draw.text((badge_cx - lbl_w / 2, badge_cy + 14), "LEVEL", font=font_level_lbl, fill=(60, 45, 15))
+
+        # شريط الخبرة
+        bar_x, bar_y, bar_w, bar_h = 80, 245, W - 160, 26
+        _rounded_rect(draw, [bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=13, fill=(255, 255, 255, 35))
+        fill_w = max(int(bar_w * (into_level / needed)), bar_h) if needed and into_level > 0 else 0
+        if fill_w:
+            _rounded_rect(draw, [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=13, fill=(120, 220, 150, 255))
+        xp_txt = f"{into_level} / {needed} XP"
+        xw = draw.textlength(xp_txt, font=font_xp)
+        draw.text((bar_x + bar_w - xw, bar_y - 28), xp_txt, font=font_xp, fill=(220, 220, 230))
+
+        # بطاقات إحصائيات صغيرة (رصيد / فوز / خسارة) في صف واحد
+        stats = [
+            (f"{balance}", "💎 الرصيد", (255, 210, 90)),
+            (f"{wins}", "🏆 فوز", (120, 220, 150)),
+            (f"{losses}", "💔 خسارة", (230, 110, 110)),
+        ]
+        box_w = (bar_w - 40) // 3
+        box_y, box_h = 320, 130
+        for i, (value, label, color) in enumerate(stats):
+            box_x = bar_x + i * (box_w + 20)
+            _rounded_rect(
+                draw, [box_x, box_y, box_x + box_w, box_y + box_h],
+                radius=18, fill=(255, 255, 255, 22)
+            )
+            vw = draw.textlength(value, font=font_stat_val)
+            draw.text((box_x + box_w / 2 - vw / 2, box_y + 22), value, font=font_stat_val, fill=color)
+            lbl = render_arabic(label)
+            lw2 = draw.textlength(lbl, font=font_stat_lbl)
+            draw.text((box_x + box_w / 2 - lw2 / 2, box_y + 75), lbl, font=font_stat_lbl, fill=(230, 230, 235))
+
+        # تحويل من RGBA لـ RGB نهائي عشان نحفظ PNG نضيف
+        final_img = Image.new("RGB", img.size, (15, 15, 35))
+        final_img.paste(img, (0, 0), img)
+
+        buf = BytesIO()
+        final_img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception as e:
+        print("⚠️ فشل إنشاء بطاقة الحساب:", e)
+        return None
+
+
+
+
+def generate_level_card(user_data_dict, full_name):
+    """يرسم بطاقة مستوى باستخدام PIL (مع skimage اختياري للحفظ)"""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        from io import BytesIO
+
+        W, H = 1000, 560
+
+        # إنشاء صورة جديدة
+        img = Image.new("RGBA", (W, H), (26, 20, 37, 255))
+        draw = ImageDraw.Draw(img, "RGBA")
+
+        # خلفية متدرجة
+        for y in range(H):
+            ratio = y / H
+            r = int(26 * (1 - ratio) + 15 * ratio)
+            g = int(20 * (1 - ratio) + 15 * ratio)
+            b = int(37 * (1 - ratio) + 30 * ratio)
+            draw.line([(0, y), (W, y)], fill=(r, g, b, 255))
+
+        # إطار البطاقة
+        draw.rounded_rectangle([30, 30, W-30, H-30], radius=28, 
+                               outline=(255, 255, 255, 60), width=2)
+
+        # الخطوط
+        arabic_font_path = "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf"
+        latin_font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+        if not os.path.exists(arabic_font_path):
+            for root, dirs, files in os.walk("/usr/share/fonts"):
+                for f in files:
+                    if "Arabic" in f and f.endswith(".ttf"):
+                        arabic_font_path = os.path.join(root, f)
+                        break
+                if os.path.exists(arabic_font_path):
+                    break
+
+        if not os.path.exists(latin_font_path):
+            latin_font_path = arabic_font_path
+
+        if not os.path.exists(arabic_font_path):
+            return None
+
+        font_name = ImageFont.truetype(arabic_font_path, 36)
+        font_title = ImageFont.truetype(arabic_font_path, 20)
+        font_level_num = ImageFont.truetype(latin_font_path, 42)
+        font_level_lbl = ImageFont.truetype(latin_font_path, 16)
+        font_stat_val = ImageFont.truetype(latin_font_path, 28)
+        font_stat_lbl = ImageFont.truetype(arabic_font_path, 18)
+        font_xp = ImageFont.truetype(latin_font_path, 16)
+
+        # البيانات
+        xp = user_data_dict.get("xp", 0)
+        level = get_level(xp)
+        _, into_level, needed = get_level_progress(xp)
+        balance = user_data_dict.get("balance", 0)
+        title = user_data_dict.get("title") or "بدون لقب"
+        wins = user_data_dict.get("wins", 0)
+        losses = user_data_dict.get("losses", 0)
+
+        # دائرة الأفاتار
+        avatar_cx, avatar_cy, avatar_r = 120, 420, 55
+        draw.ellipse([avatar_cx-avatar_r, avatar_cy-avatar_r, avatar_cx+avatar_r, avatar_cy+avatar_r], 
+                     fill=(123, 92, 245, 255))
+        initial = (full_name.strip()[:1] or "?").upper()
+        iw = draw.textlength(initial, font=font_level_num)
+        draw.text((avatar_cx - iw/2, avatar_cy - 26), initial, font=font_level_num, fill=(255, 255, 255))
+
+        # الاسم واللقب
+        name_x = avatar_cx + avatar_r + 30
+        draw.text((name_x, 410), full_name, font=font_name, fill=(255, 255, 255))
+        draw.text((name_x, 455), title, font=font_title, fill=(200, 175, 255))
+
+        # دائرة المستوى
+        badge_cx, badge_cy, badge_r = W - 130, 420, 60
+        draw.ellipse([badge_cx-badge_r, badge_cy-badge_r, badge_cx+badge_r, badge_cy+badge_r], 
+                     fill=(245, 200, 66, 255))
+        level_txt = str(level)
+        lw = draw.textlength(level_txt, font=font_level_num)
+        draw.text((badge_cx - lw/2, badge_cy - 32), level_txt, font=font_level_num, fill=(40, 30, 10))
+        lbl_w = draw.textlength("LEVEL", font=font_level_lbl)
+        draw.text((badge_cx - lbl_w/2, badge_cy + 14), "LEVEL", font=font_level_lbl, fill=(60, 45, 15))
+
+        # شريط التقدم
+        bar_x, bar_y, bar_w, bar_h = 80, 300, W - 160, 26
+        draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=13, fill=(42, 42, 58, 255))
+        fill_w = max(int(bar_w * (into_level / needed)), bar_h) if needed and into_level > 0 else 0
+        if fill_w:
+            draw.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=13, fill=(126, 231, 135, 255))
+        xp_txt = f"{into_level} / {needed} XP"
+        xw = draw.textlength(xp_txt, font=font_xp)
+        draw.text((bar_x + bar_w - xw, bar_y - 28), xp_txt, font=font_xp, fill=(220, 220, 230))
+
+        # بطاقات الإحصائيات
+        stats = [
+            (f"{balance}", "الرصيد", (255, 214, 90)),
+            (f"{wins}", "الفوز", (126, 231, 135)),
+            (f"{losses}", "الخسارة", (229, 115, 115)),
+        ]
+        box_w = (bar_w - 40) // 3
+        box_y, box_h = 180, 100
+        for i, (value, label, color) in enumerate(stats):
+            box_x = bar_x + i * (box_w + 20)
+            draw.rounded_rectangle([box_x, box_y, box_x + box_w, box_y + box_h], radius=18, fill=(37, 37, 53, 200))
+            vw = draw.textlength(value, font=font_stat_val)
+            draw.text((box_x + box_w/2 - vw/2, box_y + 22), value, font=font_stat_val, fill=color)
+            lw2 = draw.textlength(label, font=font_stat_lbl)
+            draw.text((box_x + box_w/2 - lw2/2, box_y + 65), label, font=font_stat_lbl, fill=(230, 230, 235))
+
+        # تحويل لـ RGB
+        final_img = Image.new("RGB", img.size, (15, 15, 35))
+        final_img.paste(img, (0, 0), img)
+
+        # حفظ الصورة
+        buf = BytesIO()
+        final_img.save(buf, format="PNG")
+        buf.seek(0)
+
+        # محاولة استخدام skimage لو متاح
+        try:
+            from skimage import io
+            import imageio.v3 as iio
+            img_arr = io.imread(buf)
+            buf2 = BytesIO()
+            iio.imwrite(buf2, img_arr, extension=".png")
+            return buf2.getvalue()
+        except Exception:
+            # skimage غير متاح — نرجع PIL مباشرة
+            buf.seek(0)
+            return buf.getvalue()
+
+    except Exception as e:
+        print("⚠️ فشل إنشاء بطاقة المستوى:", e)
+        import traceback
+        traceback.print_exc()
+        return None
+def extract_uid_from_url(url: str) -> str:
+    url = url.strip()
+    patterns = [
+        r'facebook\.com/profile\.php\?id=(\d+)',
+        r'facebook\.com/([a-zA-Z0-9._-]+)/?$',
+        r'facebook\.com/([a-zA-Z0-9._-]+)\?',
+        r'fb\.com/([a-zA-Z0-9._-]+)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+def decorate_notice(text):
+    return f"╭━━━━━ 📢 إشعار ━━━━━╮\n\n{text}\n\n╰━━━━━━━━━━━━━━━━━━╯"
+
+async def fetch_all_threads_paginated(client, fetch_limit=100, max_pages=30):
+    """\n"
+    "يجيب قائمة المحادثات المتاحة عن طريق fetch_thread_list.\n"
+    "ملحوظة: لا يوجد تأكيد من توثيق المكتبة أن fetch_thread_list يدعم
+    pagination حقيقي (زي معامل before/cursor)، لذلك هذه الدالة تجيب
+    أكبر عدد ممكن في طلب واحد فقط حسب fetch_limit، وليست ضمانة
+    لجلب كل المحادثات لو كانت أكتر من الحد الأقصى المسموح للمكتبة.
+    """
+    try:
+        threads = await client.fetch_thread_list(limit=fetch_limit)
+        return threads or []
+    except Exception:
+        return []
+
+# ==================== صلاحيات الإدارة ====================
+async def is_group_admin(client, thread_id, user_id):
+    """يتحقق إذا كان المستخدم أدمن في المجموعة"""
+    try:
+        info_tuple = await client.fetch_thread_info([thread_id])
+        if info_tuple and len(info_tuple) > 0:
+            info = info_tuple[0]
+            admin_ids = (
+                getattr(info, 'admin_ids', None)
+                or getattr(info, 'admins', None)
+                or getattr(info, 'admin_ids_list', None)
+                or []
+            )
+            # بعض النسخ قد ترجع كائنات بدل أرقام
+            normalized = []
+            for a in admin_ids:
+                aid = getattr(a, 'uid', None) or getattr(a, 'id', None) or a
+                normalized.append(str(aid))
+            return str(user_id) in normalized
+    except Exception:
+        pass
+    return False
+
+async def can_manage_group(client, thread_id, user_id):
+    """المطور مسموح دائمًا + أدمن المجموعة الحالية"""
+    if str(user_id) == str(DEV_ID):
+        return True
+    return await is_group_admin(client, thread_id, user_id)
+
+# ==================== الألعاب ====================
+async def game_luck(client, thread_id, user_id, user_name):
+    user = get_user(user_id, user_name)
+    if user["balance"] < 100:
+        await client.send_message("❌ رصيدك غير كافي! تحتاج 100 💎", thread_id)
+        return
+    add_balance(user_id, -100)
+    user["games_played"] += 1
+    add_xp(user_id, 10)
+    outcomes = [
+        {"text": "💰 ربحت 1000 نقطة!", "amount": 1000},
+        {"text": "💎 ربحت 5000 نقطة!", "amount": 5000},
+        {"text": "🍀 أنت محظوظ! +2000", "amount": 2000},
+        {"text": "💸 خسرت 200 نقطة", "amount": -200},
+        {"text": "👑 ربحت تاج! +3000", "amount": 3000},
+        {"text": "💔 خسرت 300 نقطة", "amount": -300},
+        {"text": "⭐ ربحت نجمة! +800", "amount": 800},
+        {"text": "🎰 جاك بوت! +1500", "amount": 1500},
+    ]
+    outcome = random.choice(outcomes)
+    new_balance = add_balance(user_id, outcome["amount"])
+    if outcome["amount"] > 0:
+        user["wins"] += 1
+    else:
+        user["losses"] += 1
+    save_users()
+    await client.send_message(
+        f"╭━━━━━ 🎰 حظ ━━━━━╮\n\n"
+        f"👤 {user_name}\n🎲 {outcome['text']}\n💰 الرصيد: {new_balance} 💎\n\n╰━━━━━━━━━━━━━━━━━━╯",
+        thread_id
+    )
+
+async def game_slots(client, thread_id, user_id, user_name):
+    """تبدأ مغامرة السلوتس متعددة المراحل"""
+    await start_slots_adventure(client, thread_id, user_id, user_name)
+
+async def game_dare(client, thread_id, user_name):
+    truths = [
+        "ما هو أكثر موقف محرج تعرضت له؟",
+        "من هو الشخص الذي لا تستطيع الاعتذار له؟",
+        "ما هو الشيء الذي تخفيه عن أصدقائك؟",
+        "ما هي أسوأ عادة تمتلكها؟",
+        "ما هو أكثر شيء تخاف منه؟",
+        "هل سبق لك أن كذبت على صديق مقرب؟",
+        "ما هو أغرب حلم راودك؟",
+        "ما هو الشيء الذي تندم عليه؟",
+        "من هو الشخص الذي تحبه سراً؟",
+        "ما هو سرك الذي لا يعرفه أحد؟",
+    ]
+    await client.send_message(
+        f"╭━━━━━ 🔮 صراحة ━━━━━╮\n\n"
+        f"👤 {user_name}\n❓ {random.choice(truths)}\n\n🗣️ أجب بصراحة!\n\n╰━━━━━━━━━━━━━━━━━━╯",
+        thread_id
+    )
+
+async def game_bet(client, thread_id, user1_id, user1_name, user2_id, user2_name):
+    user1, user2 = get_user(user1_id, user1_name), get_user(user2_id, user2_name)
+    bet_amount = 300
+    if user1["balance"] < bet_amount or user2["balance"] < bet_amount:
+        await client.send_message("❌ أحد اللاعبين رصيده غير كافي!", thread_id)
+        return
+    add_balance(user1_id, -bet_amount)
+    add_balance(user2_id, -bet_amount)
+    options = ["🎲 حجر", "📄 ورقة", "✂️ مقص"]
+    p1, p2 = random.choice(options), random.choice(options)
+    if p1 == p2:
+        add_balance(user1_id, bet_amount)
+        add_balance(user2_id, bet_amount)
+        result = "🤝 تعادل!"
+    elif (p1 == "🎲 حجر" and p2 == "✂️ مقص") or (p1 == "📄 ورقة" and p2 == "🎲 حجر") or (p1 == "✂️ مقص" and p2 == "📄 ورقة"):
+        add_balance(user1_id, bet_amount * 2)
+        result = f"🏆 {user1_name} فاز! +{bet_amount*2}"
+        user1["wins"] += 1
+        user2["losses"] += 1
+    else:
+        add_balance(user2_id, bet_amount * 2)
+        result = f"🏆 {user2_name} فاز! +{bet_amount*2}"
+        user2["wins"] += 1
+        user1["losses"] += 1
+    save_users()
+    await client.send_message(
+        f"╭━━━━━ 🤝 رهان ━━━━━╮\n\n"
+        f"👤 {user1_name}: {p1}\n👤 {user2_name}: {p2}\n\n{result}\n\n╰━━━━━━━━━━━━━━━━━━╯",
+        thread_id
+    )
+
+async def game_bet_solo(client, thread_id, user_id, user_name):
+    """رهان حجر ورقة مقص ضد البوت (فردي)"""
+    user = get_user(user_id, user_name)
+    bet_amount = 300
+    if user["balance"] < bet_amount:
+        await client.send_message(f"❌ رصيدك غير كافي! تحتاج {bet_amount} 💎", thread_id)
+        return
+    add_balance(user_id, -bet_amount)
+    options = ["🎲 حجر", "📄 ورقة", "✂️ مقص"]
+    p1, bot_choice = random.choice(options), random.choice(options)
+    if p1 == bot_choice:
+        add_balance(user_id, bet_amount)
+        result = "🤝 تعادل! رجعت فلوسك"
+    elif (p1 == "🎲 حجر" and bot_choice == "✂️ مقص") or (p1 == "📄 ورقة" and bot_choice == "🎲 حجر") or (p1 == "✂️ مقص" and bot_choice == "📄 ورقة"):
+        add_balance(user_id, bet_amount * 2)
+        result = f"🏆 فزت! +{bet_amount*2}"
+        user["wins"] += 1
+    else:
+        result = "💔 خسرت!"
+        user["losses"] += 1
+    add_xp(user_id, 10)
+    save_users()
+    await client.send_message(
+        f"╭━━━━━ 🤝 رهان ━━━━━╮\n\n"
+        f"👤 {user_name}: {p1}\n🤖 البوت: {bot_choice}\n\n{result}\n\n╰━━━━━━━━━━━━━━━━━━╯",
+        thread_id
+    )
+
+WAR_BET = 350
+
+SLOTS_BET = 200
+
+# ==================== 🗡️ نظام المغامرة الحربية (رد على رسالة البوت) ====================
+# مغامرة تفاعلية متعددة المراحل — الرد على رسالة البوت بالرقم
+
+war_adventures = {}  # thread_id -> بيانات المغامرة النشطة
+slots_adventures = {}  # msg_id -> بيانات مغامرة السلوتس النشطة
+
+WAR_SCENARIOS = [
+    {
+        "title": "⚔️ حصار الصحراء",
+        "story": "🌙 ليلة مقمرة... أنت قائد جيش صغير (50 جندي) على حدود الصحراء. فرسان العدو (80 فارس) يقتربون من المعسكر!",
+        "stages": [
+            {
+                "text": "🏕️ المرحلة 1: العدو يقترب!\n\nالفرسان على بعد كيلومتر. إيش قرارك كقائد؟",
+                "choices": [
+                    {"label": "🛡️ تحصن داخل المعسكر واستنى الهجوم", "health": 0, "armor": 15, "gold": 0, "xp": 5, "soldiers": 0, "desc_win": "التحصن نجح! خسارتك صفر.", "desc_lose": "العدو كسر التحصن! خسرت 10 جنود.", "chance": 0.95, "risk": 0},
+                    {"label": "⚔️ انطلق للهجوم المباغت", "health": -15, "armor": 0, "gold": 80, "xp": 20, "soldiers": -8, "desc_win": "الهجوم نجح بس خسرت 8 جنود وجرحت!", "desc_lose": "الهجوم فشل! خسرت 20 جندي وجرحت بشدة!", "chance": 0.65, "risk": 50},
+                    {"label": "🏹 أرسل الكشافة وانسحب للتلال", "health": 0, "armor": 5, "gold": 30, "xp": 10, "soldiers": -2, "desc_win": "الكشافة اكتشفت ضعف العدو! خسرت 2 جنود بس.", "desc_lose": "الكشافة اكتشفت قوة العدو! خسرت 5 جنود.", "chance": 0.85, "risk": 20},
+                ]
+            },
+            {
+                "text": "🔥 المرحلة 2: المعركة بدأت!\n\nالعدو أقوى من المتوقع. الجنود بيستغيثوا. إيش بتسوي؟",
+                "choices": [
+                    {"label": "💣 استخدم البراميل المتفجرة", "health": -25, "armor": -10, "gold": 150, "xp": 25, "soldiers": -12, "desc_win": "انفجار ضخم! العدو انهزم بس خسرت 12 جندي!", "desc_lose": "البراميل انفجرت في وجهك! خسرت 25 جندي!", "chance": 0.55, "risk": 80},
+                    {"label": "🐎 انسحب بذكاء واعمل كمين", "health": -5, "armor": 0, "gold": 100, "xp": 15, "soldiers": -3, "desc_win": "الكمين نجح! خسرت 3 جنود بس.", "desc_lose": "العدو كشف الكمين! خسرت 12 جندي!", "chance": 0.75, "risk": 40},
+                    {"label": "🗡️ قاتل بشرف حتى النهاية", "health": -35, "armor": -15, "gold": 200, "xp": 35, "soldiers": -20, "desc_win": "معركة شرسة! خسرت 20 جندي بس العدو انسحب!", "desc_lose": "هزيمة مدوية! خسرت 35 جندي!", "chance": 0.45, "risk": 100},
+                ]
+            },
+            {
+                "text": "👑 المرحلة 3: القائد العدو!\n\nقائد العدو بيتحدّاك لمواجهة فردية. آخر قرار!",
+                "choices": [
+                    {"label": "⚔️ اقبل التحدي وواجهه بسيفك", "health": -30, "armor": -10, "gold": 300, "xp": 45, "soldiers": -5, "desc_win": "مواجهة أسطورية! سقط القائد بس جرحت جداً!", "desc_lose": "القائد أقوى منك! خسرت 15 جندي!", "chance": 0.50, "risk": 80, "boss": True},
+                    {"label": "🏹 اضربه بسهم من بعيد", "health": -10, "armor": 0, "gold": 200, "xp": 25, "soldiers": 0, "desc_win": "سهم قاتل! القائد سقط وانت بخير!", "desc_lose": "السهم أخطأ! القائد هاجم وخسرت 8 جنود!", "chance": 0.70, "risk": 50, "boss": True},
+                    {"label": "🛡️ ارفض وخلّي جنودك يهاجموه", "health": -15, "armor": -5, "gold": 150, "xp": 20, "soldiers": -10, "desc_win": "الجنود هاجموا مع بعض! القائد سقط!", "desc_lose": "القائد هزم الجنود! خسرت 20 جندي!", "chance": 0.60, "risk": 70, "boss": True},
+                ]
+            }
+        ],
+        "ending_win": "🏆 انتصرت! القائد العدو سقط والمعسكر آمن. الجنود الباقين بيهتفوا باسمك!",
+        "ending_lose": "💀 هُزمت... الجيش اتبعثر والعدو استولى على المعسكر. بس مجدك هيفضل حيّ في الذاكرة.",
+    },
+    {
+        "title": "🐉 وادي التنانين",
+        "story": "🔥 قرية صغيرة تحت تهديد تنين عملاق! عندك 40 مقاتل. الأهالي بيستغيثوا بيك.",
+        "stages": [
+            {
+                "text": "🐲 المرحلة 1: التنين بيقترب!\n\nالنار بتغطّي السماء والقرية بتترجاك. إيش بتسوي؟",
+                "choices": [
+                    {"label": "🧪 استخدم سمّ الثعابين", "health": -5, "armor": 0, "gold": 100, "xp": 15, "soldiers": -3, "desc_win": "السمّ أثر على التنين! خسرت 3 مقاتلين.", "desc_lose": "السمّ ضعيف! التنين هاجم وخسرت 10 مقاتلين!", "chance": 0.70, "risk": 40},
+                    {"label": "🛡️ اركب على ظهره واضرب عينه", "health": -25, "armor": -10, "gold": 200, "xp": 30, "soldiers": -15, "desc_win": "مغامرة مجنونة! ضربت عين التنين!", "desc_lose": "التنين رمّاك! خسرت 25 مقاتل!", "chance": 0.40, "risk": 100},
+                    {"label": "🏃 اجري واستنى الفرصة", "health": 0, "armor": 10, "gold": 40, "xp": 5, "soldiers": 0, "desc_win": "استنيت الفرصة. التنين تعب شوية.", "desc_lose": "التنين لاحقك! خسرت 5 مقاتلين!", "chance": 0.90, "risk": 15},
+                ]
+            },
+            {
+                "text": "🔥 المرحلة 2: التنين غضبان!\n\nبينفث نار هائلة. القرية بتولع!",
+                "choices": [
+                    {"label": "💧 اقفز في البحيرة", "health": -5, "armor": 0, "gold": 60, "xp": 10, "soldiers": -2, "desc_win": "الماء حمّاك! خسرت 2 بس.", "desc_lose": "البخار حرقك! خسرت 8 مقاتلين!", "chance": 0.80, "risk": 30},
+                    {"label": "🗡️ استخدم الدرع السحري واقترب", "health": -20, "armor": -5, "gold": 180, "xp": 25, "soldiers": -10, "desc_win": "الدرع تحمل شوية! ضربت التنين!", "desc_lose": "الدرع انصهر! خسرت 18 مقاتل!", "chance": 0.55, "risk": 70},
+                    {"label": "🪨 اقفز وراء الصخور", "health": -10, "armor": -5, "gold": 80, "xp": 10, "soldiers": -5, "desc_win": "الصخور حمّاتك جزئياً.", "desc_lose": "النار وصلتلك! خسرت 12 مقاتل!", "chance": 0.70, "risk": 45},
+                ]
+            },
+            {
+                "text": "⚔️ المرحلة 3: الضربة القاضية!\n\nالتنين ضعيف. آخر فرصة!",
+                "choices": [
+                    {"label": "🗡️ اضرب قلبه بسيفك المقدّس", "health": -25, "armor": 0, "gold": 350, "xp": 50, "soldiers": -8, "desc_win": "السيف اخترق قلب التنين! انتصار أسطوري!", "desc_lose": "التنين دافع! خسرت 18 مقاتل!", "chance": 0.55, "risk": 80, "boss": True},
+                    {"label": "🏹 اضربه بسهم النار في عنقه", "health": -15, "armor": 0, "gold": 250, "xp": 30, "soldiers": -3, "desc_win": "سهم النار أصاب عنق التنين! سقط!", "desc_lose": "السهم ارتد! خسرت 10 مقاتلين!", "chance": 0.65, "risk": 50, "boss": True},
+                    {"label": "🧙 استخدم تعويذة التجميد", "health": -5, "armor": 0, "gold": 300, "xp": 35, "soldiers": 0, "desc_win": "التعويذة نجحت! التنين تجمد وسقط!", "desc_lose": "التعويذة فشلت! التنين هاجم!", "chance": 0.60, "risk": 60, "boss": True},
+                ]
+            }
+        ],
+        "ending_win": "🐉 التنين سقط! القرية آمنة والأهالي بيهتفوا باسم البطل! أنت الأسطورة الجديدة!",
+        "ending_lose": "🔥 التنين انتصر... القرية اتدمرت. بس شجاعتك هتفضل مثال للأجيال الجاية.",
+    },
+    {
+        "title": "⚓ معركة الأمواج",
+        "story": "🌊 أنت قبطان سفينة حربية (60 بحار). 4 سفن عدوانية بتحاصرك من كل الجهات!",
+        "stages": [
+            {
+                "text": "⚓ المرحلة 1: السفن تحاصرك!\n\n4 سفن عدوانية بتحاصرك. إيش بتسوي؟",
+                "choices": [
+                    {"label": "💣 استخدم المدافع", "health": -10, "armor": -5, "gold": 120, "xp": 20, "soldiers": -8, "desc_win": "المدافع دمرت سفينة! خسرت 8 بحار.", "desc_lose": "المدافع انفجرت! خسرت 18 بحار!", "chance": 0.70, "risk": 50},
+                    {"label": "🌫️ استخدم الضباب كتمويه", "health": 0, "armor": 10, "gold": 50, "xp": 10, "soldiers": 0, "desc_win": "الضباب نجح! هربت بدون خساير.", "desc_lose": "الرياح بدّدت الضباب! خسرت 5 بحار!", "chance": 0.85, "risk": 20},
+                    {"label": "⚔️ اقتحم السفينة العدوية", "health": -25, "armor": -10, "gold": 200, "xp": 30, "soldiers": -18, "desc_win": "اقتحام بطولي! دمرت سفينتين!", "desc_lose": "العدو كان مستعد! خسرت 30 بحار!", "chance": 0.45, "risk": 100},
+                ]
+            },
+            {
+                "text": "🌊 المرحلة 2: عاصفة بحرية!\n\nالموج عالي والسفن بتتخبّط. إختيارك؟",
+                "choices": [
+                    {"label": "⛵ ارفع الشراع واستغل الرياح", "health": -10, "armor": 0, "gold": 100, "xp": 15, "soldiers": -5, "desc_win": "الرياح ساعدتك! خسرت 5 بحار.", "desc_lose": "الرياح كسرت السفينة! خسرت 15 بحار!", "chance": 0.65, "risk": 45},
+                    {"label": "⚓ ثبّت السفينة واستنى", "health": -15, "armor": -5, "gold": 70, "xp": 10, "soldiers": -8, "desc_win": "السفينة ثبتت بصعوبة. خسرت 8 بحار.", "desc_lose": "السفينة غرقت جزئياً! خسرت 18 بحار!", "chance": 0.60, "risk": 60},
+                    {"label": "🦈 اقفز في الماء واسبح", "health": -30, "armor": 0, "gold": 30, "xp": 5, "soldiers": -20, "desc_win": "سباحة مجنونة! خسرت 20 بحار بس نجوت!", "desc_lose": "القرش هاجم! خسرت 35 بحار!", "chance": 0.30, "risk": 120},
+                ]
+            },
+            {
+                "text": "👑 المرحلة 3: القبطان العدو!\n\nقبطان العدو بيتحدّاك لمعركة فردية. آخر قرار!",
+                "choices": [
+                    {"label": "⚔️ سيف ضد سيف — شرف", "health": -30, "armor": -10, "gold": 350, "xp": 45, "soldiers": -5, "desc_win": "معركة شرف! انتصرت بس جرحت جداً!", "desc_lose": "القبطان أحسن منك! خسرت 15 بحار!", "chance": 0.50, "risk": 80, "boss": True},
+                    {"label": "🪝 استخدم الخطاف واسحبه", "health": -10, "armor": 0, "gold": 220, "xp": 25, "soldiers": 0, "desc_win": "الخطاف نجح! القبطان سقط في البحر!", "desc_lose": "الخطاف فشل! القبطان هاجم!", "chance": 0.70, "risk": 40, "boss": True},
+                    {"label": "💣 احرق سفينته", "health": -20, "armor": -10, "gold": 280, "xp": 30, "soldiers": -10, "desc_win": "السفينة اتحرقت! القبطان سقط!", "desc_lose": "النار رجعت عليك! خسرت 20 بحار!", "chance": 0.55, "risk": 70, "boss": True},
+                ]
+            }
+        ],
+        "ending_win": "⚓ انتصرت في البحر! الأمواج بتغنّي لمجدك والبحارة بيهتفوا باسمك!",
+        "ending_lose": "🌊 غرقت في أعماق البحر... بس قصتك هتفضل حيّة بين البحارة.",
+    },
+]
+
+
+# ==================== 🎰 نظام مغامرة السلوتس (متعدد المراحل) ====================
+
+SLOTS_SCENARIOS = [
+    {
+        "title": "🎰 ليلة الكازينو",
+        "story": "🌃 دخلت كازينو فاخر في لاس فيغاس. عندك 200 💎 رهان. الهدف: تكبير الرصيد أو تخرج ولو بربح بسيط!",
+        "stages": [
+            {
+                "text": "🎰 المرحلة 1: اختيار الآلة\n\n3 آلات سلوتس قدامك. كل آلة لها احتمالات مختلفة:",
+                "choices": [
+                    {"label": "🍒 آلة الفاكهة — آمنة (80% ربح 200 💎)", "balance": 200, "xp": 5, "risk": 0, "chance": 0.80, "desc_win": "🍒🍒🍒 فوز! آلة الفاكهة دفعت 200 💎", "desc_lose": "🍒🍋🍊 خسارة! آلة الفاكهة ما دفعتش"},
+                    {"label": "💎 آلة الماس — متوسطة (50% ربح 500 💎 / 50% خسارة 100 💎)", "balance": 500, "xp": 15, "risk": 100, "chance": 0.50, "desc_win": "💎💎💎 جاك بوت صغير! 500 💎", "desc_lose": "💎🍋💔 خسارة! دفعت 100 💎 للآلة"},
+                    {"label": "🔥 آلة النار — خطيرة (30% ربح 1000 💎 / 70% خسارة 300 💎)", "balance": 1000, "xp": 25, "risk": 300, "chance": 0.30, "desc_win": "🔥🔥🔥 جاك بوت كبير! 1000 💎", "desc_lose": "🔥💔🔥 خسارة مدمرة! خسرت 300 💎"},
+                ]
+            },
+            {
+                "text": "💰 المرحلة 2: طاولة البوكر\n\nجمعت بعض الفلوس. طاولة البوكر قدامك. إيش بتسوي؟",
+                "choices": [
+                    {"label": "🏦 انسحب بحذر واحتفظ بربحك (+150 💎 مضمون)", "balance": 150, "xp": 5, "risk": 0, "chance": 1.0, "desc_win": "🏦 ذكي! سحبت 150 💎 بأمان", "desc_lose": ""},
+                    {"label": "⚡ العب يد واحدة (55% ربح 800 💎 / 45% خسارة 200 💎)", "balance": 800, "xp": 20, "risk": 200, "chance": 0.55, "desc_win": "♠️♥️♣️♦️ فوز! 800 💎 من البوكر", "desc_lose": "♠️♥️♣️💔 خسارة! خسرت 200 💎 في البوكر"},
+                    {"label": "🎲 العب كل شيء (25% ربح 2000 💎 / 75% خسارة 500 💎)", "balance": 2000, "xp": 35, "risk": 500, "chance": 0.25, "desc_win": "🎲🎲🎲 ربحت كل شيء! 2000 💎", "desc_lose": "🎲💔🎲 كارثة! خسرت 500 💎"},
+                ]
+            },
+            {
+                "text": "👑 المرحلة 3: العجلة الذهبية!\n\nآخر فرصة. العجلة النهائية بتدور. كل شيء على المحك!",
+                "choices": [
+                    {"label": "🎯 العب الآمن (+300 💎 مضمونة)", "balance": 300, "xp": 10, "risk": 0, "chance": 1.0, "desc_win": "🎯 آمن ومربح! 300 💎", "desc_lose": ""},
+                    {"label": "💣 العب الجائزة الكبرى (35% ربح 1500 💎 / 65% لا شيء)", "balance": 1500, "xp": 40, "risk": 0, "chance": 0.35, "desc_win": "💣💣💣 الجائزة الكبرى! 1500 💎", "desc_lose": "💣💔💣 العجلة وقفت على الصفر! لا شيء"},
+                    {"label": "🌟 العب الجائزة الأسطورية (12% ربح 5000 💎 / 88% لا شيء)", "balance": 5000, "xp": 60, "risk": 0, "chance": 0.12, "desc_win": "🌟🌟🌟 أسطورة! 5000 💎 جاك بوت", "desc_lose": "🌟💔🌟 الحظ خانك! لا شيء"},
+                ]
+            }
+        ],
+        "ending_win": "🎉 ربحت المغامرة! خرجت من الكازينو وانت غني وفرحان!",
+        "ending_lose": "😢 خسرت في الكازينو... بس الحظ ممكن يتغير بكرة!",
+        "ending_break_even": "😐 طلعت بلا ربح ولا خسارة... على الأقل جربت حظك!",
+    },
+    {
+        "title": "💎 منجم الألماس الملعون",
+        "story": "🏜️ سمعت عن منجم ألماس مهجور في الصحراء. عندك 200 💎 لتجهيز رحلتك. الكنوز في انتظارك... أو الموت!",
+        "stages": [
+            {
+                "text": "⛏️ المرحلة 1: دخول المنجم\n\n3 مداخل للمنجم. كل واحد فيه مخاطر:",
+                "choices": [
+                    {"label": "🛤️ المدخل الآمن (85% تجد 150 💎)", "balance": 150, "xp": 5, "risk": 0, "chance": 0.85, "desc_win": "🛤️ وجدت ألماس! 150 💎", "desc_lose": "🛤️💔 المدخل فاضي! لا شيء"},
+                    {"label": "🌉 الجسر المعلق (45% تجد 500 💎 / 55% تسقط -200 💎)", "balance": 500, "xp": 18, "risk": 200, "chance": 0.45, "desc_win": "🌉 جسر النصر! 500 💎", "desc_lose": "🌉💔 سقطت من الجسر! خسرت 200 💎"},
+                    {"label": "🕳️ المغارة المظلمة (25% تجد 900 💎 / 75% تضيع -400 💎)", "balance": 900, "xp": 28, "risk": 400, "chance": 0.25, "desc_win": "🕳️ كنز المغارة! 900 💎", "desc_lose": "🕳️💔 فخ! خسرت 400 💎"},
+                ]
+            },
+            {
+                "text": "💎 المرحلة 2: صندوق الكنز!\n\nلقيت صندوق كنز قديم. إيش بتسوي؟",
+                "choices": [
+                    {"label": "🔓 افتحه بحذر (+200 💎 مضمون)", "balance": 200, "xp": 5, "risk": 0, "chance": 1.0, "desc_win": "🔓 آمن! 200 💎 داخل الصندوق", "desc_lose": ""},
+                    {"label": "💥 اكسره بعنف (50% ربح 800 💎 / 50% خسارة 250 💎)", "balance": 800, "xp": 22, "risk": 250, "chance": 0.50, "desc_win": "💥 كنز ضخم! 800 💎", "desc_lose": "💥💔 فخ متفجر! خسرت 250 💎"},
+                    {"label": "🧙 استخدم خريطة قديمة (20% ربح 1600 💎 / 80% لا شيء)", "balance": 1600, "xp": 32, "risk": 0, "chance": 0.20, "desc_win": "🧙 الخريطة كشفت كنز أسطوري! 1600 💎", "desc_lose": "🧙💔 الخريطة غلط! لا شيء"},
+                ]
+            },
+            {
+                "text": "👑 المرحلة 3: التنين الحارس!\n\nتنين ضخم بيحمي أكبر كنز في المنجم!",
+                "choices": [
+                    {"label": "🏃 اهرب بما جمعت (+250 💎 مضمون)", "balance": 250, "xp": 8, "risk": 0, "chance": 1.0, "desc_win": "🏃 ذكي! هربت بـ 250 💎", "desc_lose": ""},
+                    {"label": "⚔️ حارب التنين (30% ربح 2500 💎 / 70% لا شيء)", "balance": 2500, "xp": 45, "risk": 0, "chance": 0.30, "desc_win": "⚔️⚔️⚔️ هزمت التنين! 2500 💎 كنز", "desc_lose": "⚔️💔 التنين أقوى منك! لا شيء"},
+                    {"label": "🤝 قايضه بالذهب (55% ربح 1200 💎 / 45% خسارة 300 💎)", "balance": 1200, "xp": 28, "risk": 300, "chance": 0.55, "desc_win": "🤝 التنين قبل الصفقة! 1200 💎", "desc_lose": "🤝💔 التنين خانك! خسرت 300 💎"},
+                ]
+            }
+        ],
+        "ending_win": "🏆 انتصرت! رجعت من المنجم ومعك كنوز لا تُعد! أنت ملك الألماس!",
+        "ending_lose": "🐉 التنين هزمك... بس على الأقل رجعت بحياتك! المغامرة مستمرة!",
+        "ending_break_even": "😐 طلعت بلا ربح ولا خسارة... المنجم كان صعب!",
+    },
+    {
+        "title": "🚀 سباق المجرات",
+        "story": "🌌 انضميت لسباق فضاء بين الكواكب! 200 💎 رهانك. الجائزة: كنز كوني!",
+        "stages": [
+            {
+                "text": "🚀 المرحلة 1: اختيار السفينة\n\n3 سفن فضائية. كل واحدة بسرعة ومخاطر مختلفة:",
+                "choices": [
+                    {"label": "🛸 سفينة آمنة (90% ربح 180 💎)", "balance": 180, "xp": 5, "risk": 0, "chance": 0.90, "desc_win": "🛸 رحلة آمنة! 180 💎", "desc_lose": "🛸💔 عطل بسيط! لا شيء"},
+                    {"label": "🚀 صاروخ سريع (40% ربح 500 💎 / 60% عطل -150 💎)", "balance": 500, "xp": 18, "risk": 150, "chance": 0.40, "desc_win": "🚀 صاروخ النصر! 500 💎", "desc_lose": "🚀💔 انفجار محرك! خسرت 150 💎"},
+                    {"label": "☄️ نيزك مجنون (20% ربح 1000 💎 / 80% انفجار -400 💎)", "balance": 1000, "xp": 30, "risk": 400, "chance": 0.20, "desc_win": "☄️ نيزك الذهب! 1000 💎", "desc_lose": "☄️💥 انفجار مدمر! خسرت 400 💎"},
+                ]
+            },
+            {
+                "text": "🌑 المرحلة 2: كويكب الموارد\n\nكويكب قدامك مليان موارد نادرة!",
+                "choices": [
+                    {"label": "🛰️ ارسل روبوت (+250 💎 مضمون)", "balance": 250, "xp": 5, "risk": 0, "chance": 1.0, "desc_win": "🛰️ الروبوت جاب كنز! 250 💎", "desc_lose": ""},
+                    {"label": "👨‍🚀 انزل بنفسك (48% ربح 750 💎 / 52% خسارة 250 💎)", "balance": 750, "xp": 22, "risk": 250, "chance": 0.48, "desc_win": "👨‍🚀 بطل فضاء! 750 💎", "desc_lose": "👨‍🚀💔 جاذبية الكويكب! خسرت 250 💎"},
+                    {"label": "💣 قصف الكويكب (18% ربح 2000 💎 / 82% لا شيء)", "balance": 2000, "xp": 38, "risk": 0, "chance": 0.18, "desc_win": "💣💣💣 كنز كوني! 2000 💎", "desc_lose": "💣💔 القصف دمر كل شيء! لا شيء"},
+                ]
+            },
+            {
+                "text": "🏁 المرحلة 3: خط النهاية!\n\nآخر كوكب. الجائزة الكبرى قريبة!",
+                "choices": [
+                    {"label": "🥉 المركز الثالث (+300 💎 مضمون)", "balance": 300, "xp": 8, "risk": 0, "chance": 1.0, "desc_win": "🥉 مركز مشرف! 300 💎", "desc_lose": ""},
+                    {"label": "🥈 المركز الثاني (40% ربح 1400 💎 / 60% لا شيء)", "balance": 1400, "xp": 38, "risk": 0, "chance": 0.40, "desc_win": "🥈 فضي! 1400 💎", "desc_lose": "🥈💔 خرجت من المسار! لا شيء"},
+                    {"label": "🥇 المركز الأول (15% ربح 6000 💎 / 85% لا شيء)", "balance": 6000, "xp": 65, "risk": 0, "chance": 0.15, "desc_win": "🥇🥇🥇 بطل الكون! 6000 💎", "desc_lose": "🥇💔 سفينتك انفجرت قبل خط النهاية! لا شيء"},
+                ]
+            }
+        ],
+        "ending_win": "🚀 فزت بالسباق! الكون بأكمله بيهتف باسمك! أنت أسطورة الفضاء!",
+        "ending_lose": "💥 انفجرت سفينتك... بس روح المغامرة لسه حية!",
+        "ending_break_even": "😐 طلعت بلا ربح ولا خسارة... السباق كان قوي!",
+    },
+]
+
+def _slots_adventure_prompt(scenario, stage_idx, balance, total_earned):
+    """يرسم رسالة المرحلة الحالية"""
+    stage = scenario["stages"][stage_idx]
+    header = scenario["title"] if stage_idx == 0 else f"{scenario['title']} — المرحلة {stage_idx + 1}"
+    body = f"╭━━━━━ {header} ━━━━━╮\n\n"
+    if stage_idx == 0:
+        body += f"📖 {scenario['story']}\n\n"
+    body += f"{stage['text']}\n\n"
+    for i, choice in enumerate(stage["choices"], 1):
+        body += f"{i}️⃣ {choice['label']}\n"
+    body += f"\n💰 رصيد المغامرة: {balance} 💎 | 📊 إجمالي الربح: {total_earned}\n"
+    body += f"\n📝 رد على الرسالة دي برقم اختيارك (1 أو 2 أو 3)\n\n╰━━━━━━━━━━━━━━━━━━╯"
+    return body
+
+def _slots_adventure_result(choice):
+    """يطبق تأثير الاختيار بشكل عشوائي واقعي"""
+    chance = choice.get("chance", 1.0)
+    risk = choice.get("risk", 0)
+    roll = random.random()
+    success = roll < chance
+    balance_change = 0
+    xp = choice.get("xp", 0)
+    desc = ""
+    if success:
+        balance_change = choice.get("balance", 0)
+        desc = choice.get("desc_win", "🍀 حظ سعيد!")
+    else:
+        balance_change = -risk
+        desc = choice.get("desc_lose", "😢 حظ سيء!")
+    return balance_change, xp, desc
+
+def _slots_adventure_effects_text(balance_change, xp, desc):
+    effects = []
+    if balance_change > 0:
+        effects.append(f"💰 +{balance_change} 💎")
+    elif balance_change < 0:
+        effects.append(f"💸 {balance_change} 💎")
+    if xp > 0:
+        effects.append(f"⭐ +{xp} XP")
+    result = f"\n{desc}\n"
+    if effects:
+        result += "\n" + " | ".join(effects)
+    return result
+
+async def start_slots_adventure(client, thread_id, user_id, user_name):
+    """يبدأ مغامرة سلوتس جديدة"""
+    user = get_user(user_id, user_name)
+    if user["balance"] < SLOTS_BET:
+        await client.send_message(f"❌ رصيدك غير كافي! تحتاج {SLOTS_BET} 💎", thread_id)
+        return
+    add_balance(user_id, -SLOTS_BET)
+    user["games_played"] += 1
+    add_xp(user_id, 5)
+    save_users()
+    scenario = random.choice(SLOTS_SCENARIOS)
+    state = {
+        "user_id": str(user_id), "user_name": user_name, "scenario": scenario,
+        "stage": 0, "balance": 0, "total_earned": 0, "xp_total": 0, "bet": SLOTS_BET,
+    }
+    prompt = _slots_adventure_prompt(scenario, 0, 0, 0)
+    sent = await client.send_message(prompt, thread_id)
+    if sent:
+        msg_id = getattr(sent, 'id', None) or sent
+        if msg_id:
+            slots_adventures[str(msg_id)] = state
+
+async def handle_slots_adventure_reply(client, thread_id, sender_id, sender_name, replied_id, text):
+    """يتعامل مع رد اللاعب في مغامرة السلوتس"""
+    state = slots_adventures.get(replied_id)
+    if not state:
+        return False
+    if str(sender_id) != state["user_id"]:
+        return False
+    choice_idx = None
+    text_clean = text.strip()
+    if text_clean in ("1", "١"):
+        choice_idx = 0
+    elif text_clean in ("2", "٢"):
+        choice_idx = 1
+    elif text_clean in ("3", "٣"):
+        choice_idx = 2
+    if choice_idx is None:
+        await client.send_message("⚠️ اكتب 1 أو 2 أو 3!", thread_id)
+        return True
+    scenario = state["scenario"]
+    stage = scenario["stages"][state["stage"]]
+    if choice_idx >= len(stage["choices"]):
+        await client.send_message("❌ رقم غلط! اكتب 1 أو 2 أو 3.", thread_id)
+        return True
+    choice = stage["choices"][choice_idx]
+    balance_change, xp_gain, desc = _slots_adventure_result(choice)
+    state["balance"] += balance_change
+    state["total_earned"] += max(0, balance_change)
+    state["xp_total"] += xp_gain
+    effects_text = _slots_adventure_effects_text(balance_change, xp_gain, desc)
+    result_msg = f"✅ اخترت: {choice['label']}{effects_text}"
+    await client.send_message(result_msg, thread_id)
+    state["stage"] += 1
+    if state["stage"] >= len(scenario["stages"]):
+        total_prize = state["balance"] + state["bet"]
+        if total_prize < 0:
+            total_prize = 0
+        if state["balance"] > 200:
+            ending = scenario["ending_win"]
+            add_balance(state["user_id"], total_prize)
+            add_xp(state["user_id"], state["xp_total"])
+            effects = random.choice(["🎆 🎇 ✨", "💎 💰 ⭐", "🌟 🎖️ 🎊", "🚀 🌌 💫"])
+            await client.send_message(
+                f"╭━━━━━ 🏆 انتهت المغامرة! {effects} ━━━━━╮\n\n"
+                f"{ending}\n\n"
+                f"💰 إجمالي الربح: {state['balance']} 💎\n"
+                f"⭐ XP: +{state['xp_total']}\n"
+                f"💎 رصيدك الحالي: {get_user(state['user_id'])['balance']}\n\n"
+                f"╰━━━━━━━━━━━━━━━━━━╯", thread_id)
+            user = get_user(state["user_id"], state["user_name"])
+            user["wins"] += 1
+        elif state["balance"] > 0:
+            ending = scenario.get("ending_break_even", "😐 طلعت بربح بسيط!")
+            add_balance(state["user_id"], total_prize)
+            add_xp(state["user_id"], state["xp_total"] // 2)
+            await client.send_message(
+                f"╭━━━━━ 😐 انتهت المغامرة ━━━━━╮\n\n"
+                f"{ending}\n\n"
+                f"💰 ربح بسيط: {state['balance']} 💎\n"
+                f"⭐ XP: +{state['xp_total'] // 2}\n"
+                f"💎 رصيدك الحالي: {get_user(state['user_id'])['balance']}\n\n"
+                f"╰━━━━━━━━━━━━━━━━━━╯", thread_id)
+            user = get_user(state["user_id"], state["user_name"])
+            user["wins"] += 1
+        else:
+            ending = scenario["ending_lose"]
+            add_xp(state["user_id"], state["xp_total"] // 2)
+            await client.send_message(
+                f"╭━━━━━ 💔 انتهت المغامرة ━━━━━╮\n\n"
+                f"{ending}\n\n"
+                f"💰 خسرت: {abs(state['balance'])} 💎\n"
+                f"⭐ XP: +{state['xp_total'] // 2}\n"
+                f"💎 رصيدك الحالي: {get_user(state['user_id'])['balance']}\n\n"
+                f"╰━━━━━━━━━━━━━━━━━━╯", thread_id)
+            user = get_user(state["user_id"], state["user_name"])
+            user["losses"] += 1
+        save_users()
+        del slots_adventures[replied_id]
+        return True
+    prompt = _slots_adventure_prompt(scenario, state["stage"], state["balance"], state["total_earned"])
+    sent = await client.send_message(prompt, thread_id)
+    if sent:
+        msg_id = getattr(sent, 'id', None) or sent
+        if msg_id:
+            slots_adventures[str(msg_id)] = state
+            del slots_adventures[replied_id]
+    return True
+
+# ====== دوال المغامرة ======
+
+def _war_adventure_prompt(scenario, stage_idx, health, armor, gold, soldiers):
+    """يرسم رسالة المرحلة الحالية"""
+    stage = scenario["stages"][stage_idx]
+    header = scenario["title"] if stage_idx == 0 else f"{scenario['title']} — المرحلة {stage_idx + 1}"
+    body = f"╭━━━━━ {header} ━━━━━╮\n\n"
+    if stage_idx == 0:
+        body += f"📖 {scenario['story']}\n\n"
+    body += f"{stage['text']}\n\n"
+    for i, choice in enumerate(stage["choices"], 1):
+        body += f"{i}️⃣ {choice['label']}\n"
+    body += f"\n❤️ صحتك: {health}% | 🛡️ درعك: {armor}% | 💰 ذهبك: {gold} | ⚔️ جنودك: {soldiers}\n"
+    body += f"\n📝 رد على الرسالة دي برقم اختيارك (1 أو 2 أو 3)\n\n╰━━━━━━━━━━━━━━━━━━╯"
+    return body
+
+def _war_adventure_result(choice):
+    """يطبّق تأثير الاختيار بشكل عشوائي واقعي ويرجع النتيجة"""
+    chance = choice.get("chance", 1.0)
+    risk = choice.get("risk", 0.0)
+    roll = random.random()
+    success = roll < chance
+    health = choice.get("health", 0)
+    armor = choice.get("armor", 0)
+    gold = choice.get("gold", 0)
+    xp = choice.get("xp", 0)
+    soldiers = choice.get("soldiers", 0)
+    if success:
+        desc = choice.get("desc_win", "✅ نجحت!")
+        if risk > 0 and random.random() < 0.15:
+            health -= int(risk * 0.3)
+            desc += " (بس جرحت شوية!)"
+    else:
+        desc = choice.get("desc_lose", "❌ فشلت!")
+        health = choice.get("health", 0) - int(risk * 0.5)
+        armor = choice.get("armor", 0) - int(risk * 0.2)
+        soldiers = choice.get("soldiers", 0) - int(abs(soldiers) * 0.5) if soldiers < 0 else soldiers
+        gold = int(gold * 0.3)
+    return health, armor, gold, xp, soldiers, desc
+
+def _war_adventure_effects_text(health, armor, gold, xp, soldiers, desc):
+    """يرسم نص التأثيرات بشكل بصري"""
+    effects = []
+    if health != 0:
+        sign = "+" if health > 0 else ""
+        effects.append(f"❤️ {sign}{health}% صحة")
+    if armor != 0:
+        sign = "+" if armor > 0 else ""
+        effects.append(f"🛡️ {sign}{armor}% درع")
+    if gold != 0:
+        sign = "+" if gold > 0 else ""
+        effects.append(f"💰 {sign}{gold} ذهب")
+    if soldiers != 0:
+        sign = "+" if soldiers > 0 else ""
+        effects.append(f"⚔️ {sign}{abs(soldiers)} جندي")
+    if xp > 0:
+        effects.append(f"⭐ +{xp} XP")
+    body = f"\n{desc}\n"
+    if effects:
+        body += "\n" + " | ".join(effects)
+    return body
+
+async def start_war_adventure(client, thread_id, user_id, user_name):
+    """يبدأ مغامرة حربية جديدة"""
+    user = get_user(user_id, user_name)
+    if user["balance"] < WAR_BET:
+        await client.send_message(f"❌ رصيدك غير كافي! تحتاج {WAR_BET} 💎", thread_id)
+        return
+    add_balance(user_id, -WAR_BET)
+    scenario = random.choice(WAR_SCENARIOS)
+    state = {
+        "user_id": str(user_id), "user_name": user_name, "scenario": scenario,
+        "stage": 0, "health": 100, "armor": 50, "gold": 0, "soldiers": 50, "xp_total": 0, "bet": WAR_BET,
+    }
+    prompt = _war_adventure_prompt(scenario, 0, 100, 50, 0, 50)
+    sent = await client.send_message(prompt, thread_id)
+    if sent:
+        msg_id = getattr(sent, 'id', None) or sent
+        if msg_id:
+            war_adventures[str(msg_id)] = state
+
+async def handle_war_adventure_reply(client, thread_id, sender_id, sender_name, replied_id, text):
+    """يتعامل مع رد اللاعب في المغامرة الحربية"""
+    state = war_adventures.get(replied_id)
+    if not state:
+        return False
+    if str(sender_id) != state["user_id"]:
+        return False
+    choice_idx = None
+    text_clean = text.strip()
+    if text_clean in ("1", "١"):
+        choice_idx = 0
+    elif text_clean in ("2", "٢"):
+        choice_idx = 1
+    elif text_clean in ("3", "٣"):
+        choice_idx = 2
+    if choice_idx is None:
+        await client.send_message("⚠️ اكتب 1 أو 2 أو 3!", thread_id)
+        return True
+    scenario = state["scenario"]
+    stage = scenario["stages"][state["stage"]]
+    if choice_idx >= len(stage["choices"]):
+        await client.send_message("❌ رقم غلط! اكتب 1 أو 2 أو 3.", thread_id)
+        return True
+    choice = stage["choices"][choice_idx]
+    health_change, armor_change, gold_change, xp_gain, soldiers_change, desc = _war_adventure_result(choice)
+    state["health"] = max(0, min(100, state["health"] + health_change))
+    state["armor"] = max(0, min(100, state["armor"] + armor_change))
+    state["gold"] = max(0, state["gold"] + gold_change)
+    state["soldiers"] = max(0, state["soldiers"] + soldiers_change)
+    state["xp_total"] += xp_gain
+    effects_text = _war_adventure_effects_text(health_change, armor_change, gold_change, xp_gain, soldiers_change, desc)
+    result_msg = f"✅ اخترت: {choice['label']}{effects_text}"
+    await client.send_message(result_msg, thread_id)
+    if state["health"] <= 0 or state["soldiers"] <= 0:
+        ending = scenario["ending_lose"]
+        await client.send_message(
+            f"╭━━━━━ 💀 انتهت المغامرة ━━━━━╮\n\n"
+            f"{ending}\n\n"
+            f"💰 جمعت: {state['gold']} ذهب\n"
+            f"⭐ XP: {state['xp_total']}\n"
+            f"⚔️ جنود باقين: {state['soldiers']}\n\n"
+            f"╰━━━━━━━━━━━━━━━━━━╯", thread_id)
+        user = get_user(state["user_id"], state["user_name"])
+        user["losses"] += 1
+        save_users()
+        del war_adventures[replied_id]
+        return True
+    state["stage"] += 1
+    if state["stage"] >= len(scenario["stages"]):
+        ending = scenario["ending_win"]
+        performance_bonus = state["gold"] + (state["health"] // 10) + (state["soldiers"] // 5)
+        total_prize = state["bet"] * 2 + performance_bonus
+        add_balance(state["user_id"], total_prize)
+        add_xp(state["user_id"], state["xp_total"])
+        effects = random.choice(["🎆 🎇 ✨", "🔥 ⚔️ 🏆", "💎 💰 ⭐", "🌟 🎖️ 🎊"])
+        await client.send_message(
+            f"╭━━━━━ 🏆 انتصرت! {effects} ━━━━━╮\n\n"
+            f"{ending}\n\n"
+            f"💰 جائزة: {total_prize} 💎\n"
+            f"⭐ XP: +{state['xp_total']}\n"
+            f"❤️ صحتك: {state['health']}% | ⚔️ جنودك: {state['soldiers']}\n\n"
+            f"╰━━━━━━━━━━━━━━━━━━╯", thread_id)
+        user = get_user(state["user_id"], state["user_name"])
+        user["wins"] += 1
+        save_users()
+        del war_adventures[replied_id]
+        return True
+    prompt = _war_adventure_prompt(scenario, state["stage"], state["health"], state["armor"], state["gold"], state["soldiers"])
+    sent = await client.send_message(prompt, thread_id)
+    if sent:
+        msg_id = getattr(sent, 'id', None) or sent
+        if msg_id:
+            war_adventures[str(msg_id)] = state
+            del war_adventures[replied_id]
+    return True
+
+# ==================== محتوى عشوائي (نكتة / اقتباس / معلومة) ====================
+JOKES = [
+    "واحد سأل صاحبه: ليه بتاخد المصعد بدل السلم؟ قاله: عشان مش عايز أوصل متعب لخناقة 😂",
+    "ليه الكمبيوتر رايح الدكتور؟ عنده فيروس! 🤣",
+    "واحد قال لصاحبه: عندي ذاكرة سمكة. صاحبه قاله: من إمتى؟ قاله: من إمتى إيه؟ 😂",
+    "الفرق بين الوهم والأمل؟ الوهم إنك تفتكر إنك هتذاكر، والأمل إن اللي جنبك ما ذاكرش كمان 😅",
+    "ليه الموزة راحت الدكتور؟ عشان مكنتش حاسة كويس 🍌",
+    "واحد بيقول لصاحبه: عارف أكبر كذبة في التاريخ؟ قاله: لأ. قاله: هرد عليك بعدين 😂",
+    "ليه السمكة مبتحبش الكمبيوتر؟ عشان خايفة من الشبكة 🐟",
+    "واحد سأل: ليه الساعة زعلانة؟ عشان دايمًا بتلف في نفس الدايرة ⏰",
+]
+
+QUOTES = [
+    "🌟 النجاح ليس نهائيًا، والفشل ليس قاتلاً، الشجاعة للاستمرار هي الأهم.",
+    "💡 لا تنتظر الفرصة المثالية، اصنعها بنفسك.",
+    "🌱 كل يوم هو فرصة جديدة لتصبح أفضل مما كنت عليه بالأمس.",
+    "🔥 العقول العظيمة تناقش الأفكار، والعقول الصغيرة تناقش الأشخاص.",
+    "🌟 الوقت هو أثمن ما تملك، فلا تضيعه فيما لا يفيد.",
+    "💪 الصبر مفتاح الفرج.",
+    "🚀 ابدأ من حيث أنت، استخدم ما لديك، وافعل ما تستطيع.",
+    "🌙 السعادة ليست وجهة، بل طريقة في السفر.",
+]
+
+FACTS = [
+    "🐙 الأخطبوط له ثلاثة قلوب!",
+    "🍯 العسل لا يفسد أبدًا، عُثر على عسل عمره آلاف السنين صالح للأكل.",
+    "🦒 الزرافة تنام أقل من ساعتين في اليوم فقط.",
+    "🌍 يوم كوكب الزهرة أطول من سنته!",
+    "🐌 الحلزون يمكنه النوم لمدة تصل إلى 3 سنوات.",
+    "🧠 دماغ الإنسان يستهلك حوالي 20% من طاقة الجسم.",
+    "🦈 أسماك القرش موجودة على الأرض قبل الأشجار!",
+    "🐘 الفيلة هي الحيوان الوحيد الذي لا يستطيع القفز.",
+]
+
+SHOP_ITEMS = {
+    "1": {"type": "title", "name": "〔 الوافد 〕", "price": 3000},
+    "2": {"type": "title", "name": "〘 الظِل 〙", "price": 5000},
+    "3": {"type": "title", "name": "乂 الحارس 乂", "price": 7000},
+    "4": {"type": "title", "name": "〚 المتقدم 〛", "price": 9000},
+    "5": {"type": "title", "name": "༺ النخبة ༻", "price": 11000},
+    "6": {"type": "title", "name": "⟦ المحور ⟧", "price": 13000},
+    "7": {"type": "title", "name": "𖤐 المدافع 𖤐", "price": 15000},
+    "8": {"type": "title", "name": "〘 الطليعة 〙", "price": 17000},
+    "9": {"type": "title", "name": "꧁ المهيمن ꧂", "price": 20000},
+    "10": {"type": "title", "name": "乂 الحاكم 乂", "price": 23000},
+    "11": {"type": "title", "name": "༒ الوصي ༒", "price": 26000},
+    "12": {"type": "title", "name": "𓆩 المسيطر 𓆪", "price": 30000},
+    "13": {"type": "title", "name": "꧁༺ السيد الأعلى ༻꧂", "price": 35000},
+    "14": {"type": "title", "name": "𖤍 العرش الأعظم 𖤍", "price": 40000},
+    "15": {"type": "title", "name": "꧁༒ الكيان الأعظم ༒꧂", "price": 50000},
+    "16": {"type": "xp_boost", "name": "⚡ مضاعف خبرة (ساعة)", "price": 2000, "duration": 3600},
+    "17": {"type": "prize_boost", "name": "💰 مضاعف أرباح الألعاب (30 دقيقة)", "price": 3500, "duration": 1800},
+}
+
+async def game_random_content(client, thread_id, items, header, emoji):
+    text = random.choice(items)
+    await client.send_message(
+        f"╭━━━━━ {emoji} {header} ━━━━━╮\n\n{text}\n\n╰━━━━━━━━━━━━━━━━━━╯",
+        thread_id
+    )
+
+async def translate_text(text_to_translate, target_lang="ar"):
+    """يترجم نص باستخدام خدمة ترجمة جوجل غير الرسمية، ويرجع None لو فشل"""
+    try:
+        url = "https://translate.googleapis.com/translate_a/single"
+        params = {
+            "client": "gtx", "sl": "auto", "tl": target_lang,
+            "dt": "t", "q": text_to_translate
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+        return "".join(part[0] for part in data[0] if part[0])
+    except Exception:
+        return None
+
+async def fetch_online_joke():
+    """يجيب نكتة إنجليزية من الإنترنت ويترجمها للعربي"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://official-joke-api.appspot.com/random_joke",
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+        raw = f"{data.get('setup', '')} — {data.get('punchline', '')}".strip(" —")
+        if not raw:
+            return None
+        translated = await translate_text(raw, "ar")
+        return translated or raw
+    except Exception:
+        return None
+
+async def fetch_online_quote():
+    """يجيب اقتباس إنجليزي من الإنترنت ويترجمه للعربي"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.quotable.io/random",
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+        content = data.get("content")
+        author = data.get("author", "")
+        if not content:
+            return None
+        translated = await translate_text(content, "ar")
+        text = translated or content
+        return f"{text}\n— {author}" if author else text
+    except Exception:
+        return None
+
+async def game_mixed_content(client, thread_id, local_items, header, emoji, online_fetcher):
+    """يجيب المحتوى إما من الإنترنت (مواقع خارجية) أو من قائمة البوت المحلية، بشكل عشوائي"""
+    text = None
+    source_note = ""
+    if random.random() < 0.5:
+        text = await online_fetcher()
+        if text:
+            source_note = "🌐 من الإنترنت"
+    if not text:
+        text = random.choice(local_items)
+        source_note = "🤖 من البوت"
+    await client.send_message(
+        f"╭━━━━━ {emoji} {header} ━━━━━╮\n\n{text}\n\n{source_note}\n\n╰━━━━━━━━━━━━━━━━━━╯",
+        thread_id
+    )
+
+# ==================== إكس أو (Tic Tac Toe) ====================
+active_xo_games = {}
+
+def render_xo_board(board):
+    symbols = {" ": "⬜", "X": "❌", "O": "⭕"}
+    rows = []
+    for r in range(3):
+        rows.append("".join(symbols[board[r * 3 + c]] for c in range(3)))
+    return "\n".join(rows)
+
+def check_xo_winner(board):
+    lines = [
+        (0, 1, 2), (3, 4, 5), (6, 7, 8),
+        (0, 3, 6), (1, 4, 7), (2, 5, 8),
+        (0, 4, 8), (2, 4, 6),
+    ]
+    for a, b, c in lines:
+        if board[a] != " " and board[a] == board[b] == board[c]:
+            return board[a]
+    if " " not in board:
+        return "draw"
+    return None
+
+async def game_xo_start(client, thread_id, p1_id, p1_name, p2_id, p2_name):
+    if thread_id in active_xo_games:
+        await client.send_message("⚠️ فيه لعبة إكس أو شغالة في المجموعة دي بالفعل!", thread_id)
+        return
+    first, second = random.sample([(p1_id, p1_name, "X"), (p2_id, p2_name, "O")], 2)
+    active_xo_games[thread_id] = {
+        "board": [" "] * 9,
+        "players": {str(first[0]): first[2], str(second[0]): second[2]},
+        "names": {str(first[0]): first[1], str(second[0]): second[1]},
+        "turn": str(first[0]),
+        "order": [str(first[0]), str(second[0])],
+    }
+    await client.send_message(
+        f"╭━━━━━ ❌⭕ إكس أو ━━━━━╮\n\n"
+        f"👤 {first[1]} = ❌ | 👤 {second[1]} = ⭕\n\n"
+        f"{render_xo_board(active_xo_games[thread_id]['board'])}\n\n"
+        f"🎯 دور: {first[1]}\n📝 اكتب رقم الخانة (1-9)\n\n╰━━━━━━━━━━━━━━━━━━╯",
+        thread_id
+    )
+
+async def handle_xo_move(client, thread_id, sender_id, sender_name, text):
+    game = active_xo_games.get(thread_id)
+    if not game or str(sender_id) not in game["players"]:
+        return False
+    if not text.isdigit() or not (1 <= int(text) <= 9):
+        return False
+    if str(sender_id) != game["turn"]:
+        return True  # نص رقمي بس مش دوره، تجاهل بهدوء
+    pos = int(text) - 1
+    if game["board"][pos] != " ":
+        await client.send_message("⚠️ الخانة دي متحجزة، اختر تانية!", thread_id)
+        return True
+    game["board"][pos] = game["players"][str(sender_id)]
+    result = check_xo_winner(game["board"])
+    if result == "draw":
+        await client.send_message(
+            f"{render_xo_board(game['board'])}\n\n🤝 تعادل!",
+            thread_id
+        )
+        del active_xo_games[thread_id]
+        return True
+    if result in ("X", "O"):
+        winner_id = str(sender_id)
+        winner_name = game["names"][winner_id]
+        prize = 400
+        new_balance = add_balance(winner_id, prize)
+        add_xp(winner_id, 20)
+        await client.send_message(
+            f"{render_xo_board(game['board'])}\n\n"
+            f"🏆 {winner_name} فاز! +{prize} 💎 (رصيده: {new_balance})",
+            thread_id
+        )
+        del active_xo_games[thread_id]
+        return True
+    # الدور للاعب التاني
+    next_id = [pid for pid in game["order"] if pid != str(sender_id)][0]
+    game["turn"] = next_id
+    await client.send_message(
+        f"{render_xo_board(game['board'])}\n\n🎯 دور: {game['names'][next_id]}",
+        thread_id
+    )
+    return True
+
+# ==================== تصويت / قرعة / تاغ الكل ====================
+async def game_poll(client, thread_id, raw_text):
+    parts = [p.strip() for p in raw_text.split("|") if p.strip()]
+    if len(parts) < 3:
+        await client.send_message(
+            "⚠️ استخدام: .تصويت السؤال | خيار1 | خيار2 | ...",
+            thread_id
+        )
+        return
+    question, options = parts[0], parts[1:9]
+    number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"]
+    body = f"╭━━━━━ 📊 تصويت ━━━━━╮\n\n❓ {question}\n\n"
+    for i, opt in enumerate(options):
+        body += f"{number_emojis[i]} {opt}\n"
+    body += "\n👇 صوّت بالرياكشن على الرسالة\n\n╰━━━━━━━━━━━━━━━━━━╯"
+    sent = await client.send_message(body, thread_id)
+    msg_id = _msg_id(sent)
+    if msg_id:
+        for i in range(len(options)):
+            try:
+                await client.react(number_emojis[i], msg_id, thread_id)
+            except Exception:
+                pass
+
+# ==================== المتجر ====================
+async def game_shop(client, thread_id):
+    body = "╭━━━━━ 🛒 المتجر ━━━━━╮\n\n🎖️ ألقاب:\n"
+    for key, item in SHOP_ITEMS.items():
+        if item["type"] == "title":
+            body += f"{key}️⃣ {item['name']} — 💎 {item['price']}\n"
+    body += "\n⚡ مؤثرات مؤقتة:\n"
+    for key, item in SHOP_ITEMS.items():
+        if item["type"] != "title":
+            body += f"{key}️⃣ {item['name']} — 💎 {item['price']}\n"
+    body += "\n📝 رد على الرسالة دي برقم اللي عايز تشتريه (أو اكتب .شراء [رقم])\n\n╰━━━━━━━━━━━━━━━━━━╯"
+    sent = await client.send_message(body, thread_id)
+    msg_id = _msg_id(sent)
+    if msg_id:
+        shop_message_ids.add(msg_id)
+
+async def game_buy(client, thread_id, sender_id, sender_name, choice):
+    item = SHOP_ITEMS.get(choice)
+    if not item:
+        await client.send_message("❌ رقم غير صحيح! اكتب .متجر لعرض القائمة", thread_id)
+        return
+    u = get_user(sender_id, sender_name)
+    if u["balance"] < item["price"]:
+        await client.send_message(f"❌ رصيدك غير كافي! تحتاج {item['price']} 💎", thread_id)
+        return
+    add_balance(sender_id, -item["price"])
+
+    if item["type"] == "title":
+        u["title"] = item["name"]
+        save_users()
+        await client.send_message(
+            f"╭━━━━━ ✅ تم الشراء ━━━━━╮\n\n🎖️ حصلت على لقب: {item['name']}\n💰 رصيدك: {u['balance']}\n\n╰━━━━━━━━━━━━━━━━━━╯",
+            thread_id
+        )
+    elif item["type"] == "xp_boost":
+        u["xp_boost_until"] = max(u.get("xp_boost_until", 0), time.time()) + item["duration"]
+        save_users()
+        minutes = item["duration"] // 60
+        await client.send_message(
+            f"╭━━━━━ ✅ تم الشراء ━━━━━╮\n\n⚡ مضاعف الخبرة شغال لمدة {minutes} دقيقة!\n💰 رصيدك: {u['balance']}\n\n╰━━━━━━━━━━━━━━━━━━╯",
+            thread_id
+        )
+    elif item["type"] == "prize_boost":
+        u["prize_boost_until"] = max(u.get("prize_boost_until", 0), time.time()) + item["duration"]
+        save_users()
+        minutes = item["duration"] // 60
+        await client.send_message(
+            f"╭━━━━━ ✅ تم الشراء ━━━━━╮\n\n💰 مضاعف أرباح الألعاب شغال لمدة {minutes} دقيقة!\n💰 رصيدك: {u['balance']}\n\n╰━━━━━━━━━━━━━━━━━━╯",
+            thread_id
+        )
+
+# ==================== مزاد (سوق تبادل بين الأعضاء) ====================
+AUCTION_DURATION = 90  # ثانية
+
+async def resolve_auction_after_delay(client, thread_id, auction):
+    await asyncio.sleep(AUCTION_DURATION)
+    # لو حد بدأ مزاد جديد في نفس المجموعة قبل ما ده يخلص، متبقاش نحل المزاد القديم
+    if active_auctions.get(thread_id) is not auction:
+        return
+    del active_auctions[thread_id]
+
+    if not auction["bidder_id"]:
+        await client.send_message(
+            f"⌛ انتهى المزاد على \"{auction['description']}\" من غير أي مزايدات!",
+            thread_id
+        )
+        return
+
+    bidder = get_user(auction["bidder_id"], auction["bidder_name"])
+    if bidder["balance"] < auction["current_bid"]:
+        await client.send_message(
+            f"⌛ انتهى المزاد، بس {auction['bidder_name']} رصيده بقى غير كافي وقت الدفع! اتلغى المزاد.",
+            thread_id
+        )
+        return
+
+    add_balance(auction["bidder_id"], -auction["current_bid"])
+    add_balance(auction["seller_id"], auction["current_bid"])
+    await client.send_message(
+        f"╭━━━━━ ⌛ انتهى المزاد ━━━━━╮\n\n"
+        f"📦 على: {auction['description']}\n"
+        f"🏆 الفايز: {auction['bidder_name']} بمبلغ {auction['current_bid']} 💎\n"
+        f"💰 الفلوس اتحولت لـ {auction['seller_name']}\n\n"
+        f"╰━━━━━━━━━━━━━━━━━━╯",
+        thread_id
+    )
+
+async def game_auction_start(client, thread_id, seller_id, seller_name, price, description):
+    if thread_id in active_auctions:
+        await client.send_message("⚠️ فيه مزاد شغال في المجموعة دي بالفعل، استنى يخلص!", thread_id)
+        return
+    if price <= 0:
+        await client.send_message("❌ السعر الابتدائي لازم يكون أكبر من صفر!", thread_id)
+        return
+
+    auction = {
+        "seller_id": str(seller_id), "seller_name": seller_name,
+        "description": description, "current_bid": price,
+        "bidder_id": None, "bidder_name": None,
+    }
+    active_auctions[thread_id] = auction
+    await client.send_message(
+        f"╭━━━━━ 🔨 مزاد جديد ━━━━━╮\n\n"
+        f"👤 البايع: {seller_name}\n📦 على: {description}\n"
+        f"💰 السعر الابتدائي: {price} 💎\n⏱️ المدة: {AUCTION_DURATION} ثانية\n\n"
+        f"📝 زايد بـ .مزايدة [مبلغ]\n\n╰━━━━━━━━━━━━━━━━━━╯",
+        thread_id
+    )
+    asyncio.create_task(resolve_auction_after_delay(client, thread_id, auction))
+
+async def game_bid(client, thread_id, sender_id, sender_name, amount_str):
+    auction = active_auctions.get(thread_id)
+    if not auction:
+        await client.send_message("❌ مفيش مزاد شغال دلوقتي! ابدأ واحد بـ .مزاد [سعر] [وصف]", thread_id)
+        return
+    try:
+        amount = int(amount_str)
+    except ValueError:
+        await client.send_message("❌ اكتب مبلغ صحيح! مثال: .مزايدة 500", thread_id)
+        return
+    if str(sender_id) == auction["seller_id"]:
+        await client.send_message("❌ معلش، مينفعش تزايد على المزاد بتاعك!", thread_id)
+        return
+    if amount <= auction["current_bid"]:
+        await client.send_message(f"❌ لازم تزايد بأكتر من {auction['current_bid']} 💎!", thread_id)
+        return
+    user = get_user(sender_id, sender_name)
+    if user["balance"] < amount:
+        await client.send_message(f"❌ رصيدك غير كافي! تحتاج {amount} 💎", thread_id)
+        return
+
+    auction["current_bid"] = amount
+    auction["bidder_id"] = str(sender_id)
+    auction["bidder_name"] = sender_name
+    await client.send_message(
+        f"🔨 {sender_name} زايد بـ {amount} 💎 على \"{auction['description']}\"!",
+        thread_id
+    )
+
+# ==================== الموسم (ترتيب شهري بمكافآت) ====================
+def get_season_days_left():
+    import calendar
+    today = datetime.now()
+    last_day = calendar.monthrange(today.year, today.month)[1]
+    return last_day - today.day
+
+async def reset_season(client):
+    ranked = sorted(users_data.items(), key=lambda x: x[1].get("season_points", 0), reverse=True)
+    top3 = ranked[:3]
+    rewards = [5000, 3000, 1000]
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, (uid, data) in enumerate(top3):
+        if data.get("season_points", 0) <= 0:
+            continue
+        add_balance(uid, rewards[i])
+        lines.append(f"{medals[i]} {data.get('name', 'مجهول')} — {data.get('season_points', 0)} نقطة (+{rewards[i]} 💎)")
+
+    for uid in users_data:
+        users_data[uid]["season_points"] = 0
+    save_users()
+
+    season_data["season_number"] = season_data.get("season_number", 1) + 1
+    season_data["current_season_start"] = datetime.now().strftime("%Y-%m")
+    save_season()
+
+    # 🔕 تم إيقاف بث إعلان الموسم لكل الجروبات — التصفير وتوزيع المكافآت لسه شغالين بس بدون إرسال رسائل
+
+async def season_watcher_loop(client):
+    """بتفحص كل ساعة هل الشهر اتغيّر، ولو اتغيّر بتعمل تصفير وتوزيع مكافآت الموسم"""
+    while True:
+        try:
+            current_month = datetime.now().strftime("%Y-%m")
+            if "current_season_start" not in season_data:
+                season_data["current_season_start"] = current_month
+                season_data.setdefault("season_number", 1)
+                save_season()
+            elif season_data["current_season_start"] != current_month:
+                await reset_season(client)
+        except Exception as e:
+            print("⚠️ خطأ في مراقبة الموسم:", e)
+        await asyncio.sleep(3600)
+
+
+async def game_wiki(client, thread_id, query):
+    if not query:
+        await client.send_message("⚠️ اكتب اسم الموضوع!\nمثال: .ويكي مصر", thread_id)
+        return
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        url = f"https://ar.wikipedia.org/api/rest_v1/page/summary/{query}"
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    await client.send_message(f"❌ ملقتش نتيجة لـ: {query}", thread_id)
+                    return
+                data = await resp.json()
+        extract = data.get("extract")
+        if not extract:
+            await client.send_message(f"❌ ملقتش ملخص لـ: {query}", thread_id)
+            return
+        await client.send_message(
+            f"╭━━━━━ 📖 ويكيبيديا ━━━━━╮\n\n📌 {data.get('title', query)}\n\n{extract}\n\n╰━━━━━━━━━━━━━━━━━━╯",
+            thread_id
+        )
+    except Exception as e:
+        await client.send_message(f"❌ خطأ: {str(e)[:150]}", thread_id)
+
+async def game_translate(client, thread_id, target_lang, text_to_translate):
+    if not text_to_translate:
+        await client.send_message("⚠️ استخدام: .ترجم [كود اللغة] [النص]\nمثال: .ترجم en مرحبا", thread_id)
+        return
+    try:
+        url = "https://translate.googleapis.com/translate_a/single"
+        params = {
+            "client": "gtx", "sl": "auto", "tl": target_lang,
+            "dt": "t", "q": text_to_translate
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    await client.send_message("❌ تعذرت الترجمة، حاول تاني", thread_id)
+                    return
+                data = await resp.json(content_type=None)
+        translated = "".join(part[0] for part in data[0] if part[0])
+        await client.send_message(
+            f"╭━━━━━ 🌐 ترجمة ━━━━━╮\n\n📝 {translated}\n\n╰━━━━━━━━━━━━━━━━━━╯",
+            thread_id
+        )
+    except Exception as e:
+        await client.send_message(f"❌ خطأ: {str(e)[:150]}", thread_id)
+
+async def game_weather(client, thread_id, city):
+    if not city:
+        await client.send_message("⚠️ اكتب اسم المدينة!\nمثال: .طقس القاهرة", thread_id)
+        return
+    try:
+        url = f"https://wttr.in/{city}"
+        params = {"format": "3", "lang": "ar"}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    await client.send_message(f"❌ تعذر جلب الطقس لـ: {city}", thread_id)
+                    return
+                text = (await resp.text()).strip()
+        await client.send_message(
+            f"╭━━━━━ 🌤️ الطقس ━━━━━╮\n\n{text}\n\n╰━━━━━━━━━━━━━━━━━━╯",
+            thread_id
+        )
+    except Exception as e:
+        await client.send_message(f"❌ خطأ: {str(e)[:150]}", thread_id)
+
+# ==================== قولي (تحويل نص إلى صوت) ====================
+async def game_speak(client, thread_id, text_to_speak, user_name):
+    if not text_to_speak:
+        await client.send_message(
+            "⚠️ اكتب النص اللي عايز اسمعه!\nمثال: .قولي مرحبا بالجميع",
+            thread_id
+        )
+        return
+    try:
+        audio_filename = f"voice_{int(time.time())}.mp3"
+        tts = gTTS(text=text_to_speak, lang="ar", slow=False)
+        tts.save(audio_filename)
+        await client.send_message(
+            text=f"🎙️ {user_name} بيقول:",
+            thread_id=thread_id,
+            file_path=[audio_filename]
+        )
+        os.remove(audio_filename)
+    except Exception as e:
+        await client.send_message(f"❌ حدث خطأ أثناء توليد الصوت: {str(e)[:150]}", thread_id)
+
+# ==================== صورة (بحث وإرسال صور عبر DuckDuckGo مباشرة) ====================
+async def ddg_image_search(session, query, max_results=20):
+    # الخطوة 1: جلب رمز vqd المطلوب من DuckDuckGo
+    async with session.get(
+        "https://duckduckgo.com/",
+        params={"q": query},
+        timeout=aiohttp.ClientTimeout(total=10)
+    ) as resp:
+        html = await resp.text()
+    match = re.search(r"vqd=['\"]?([\d-]+)['\"]?", html)
+    if not match:
+        match = re.search(r"vqd=([\d-]+)&", html)
+    if not match:
+        return []
+    vqd = match.group(1)
+
+    # الخطوة 2: طلب نتائج الصور فعليًا
+    async with session.get(
+        "https://duckduckgo.com/i.js",
+        params={
+            "q": query, "o": "json", "vqd": vqd,
+            "f": ",,,,,", "p": "1"
+        },
+        headers={"Referer": "https://duckduckgo.com/"},
+        timeout=aiohttp.ClientTimeout(total=10)
+    ) as resp:
+        if resp.status != 200:
+            return []
+        data = await resp.json(content_type=None)
+    return [item["image"] for item in data.get("results", [])[:max_results] if item.get("image")]
+
+async def game_image(client, thread_id, query, user_name, count=5):
+    if not query:
+        await client.send_message(
+            "⚠️ اكتب اسم الصورة اللي عايزها!\nمثال: .صورة غوجو",
+            thread_id
+        )
+        return
+    downloaded_files = []
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        async with aiohttp.ClientSession(headers=headers) as session:
+            image_urls = await ddg_image_search(session, query, max_results=25)
+            if not image_urls:
+                await client.send_message(f"❌ ما لقيتش صور لـ: {query}", thread_id)
+                return
+            random.shuffle(image_urls)
+            for image_url in image_urls:
+                if len(downloaded_files) >= count:
+                    break
+                try:
+                    async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        content_type = resp.headers.get("Content-Type", "")
+                        if resp.status == 200 and content_type.startswith("image/"):
+                            data = await resp.read()
+                            ext = content_type.split("/")[-1].split(";")[0].strip()
+                            if ext == "jpeg":
+                                ext = "jpg"
+                            elif ext not in ("jpg", "png", "gif", "webp"):
+                                ext = "jpg"
+                            filename = f"img_{int(time.time()*1000)}_{len(downloaded_files)}.{ext}"
+                            with open(filename, "wb") as f:
+                                f.write(data)
+                            downloaded_files.append(filename)
+                except Exception:
+                    continue
+        if not downloaded_files:
+            await client.send_message(f"❌ تعذر تحميل صور صالحة لـ: {query}", thread_id)
+            return
+        await client.send_message(
+            text=f"🖼️ {user_name} طلب: {query} ({len(downloaded_files)} صور)",
+            thread_id=thread_id,
+            file_path=downloaded_files
+        )
+    except Exception:
+        await client.send_message("❌ حدث خطأ أثناء جلب الصور، جرب طلب تاني!", thread_id)
+    finally:
+        for f in downloaded_files:
+            try:
+                os.remove(f)
+            except:
+                pass
+
+# ==================== أغنية (بحث وتحميل من يوتيوب) ====================
+async def game_song(client, thread_id, query, user_name):
+    if not query:
+        await client.send_message(
+            "⚠️ اكتب اسم الأغنية!\nمثال: .اغنية عمرو دياب تملي معاك",
+            thread_id
+        )
+        return
+    if not YTDLP_AVAILABLE:
+        await client.send_message(
+            "⚠️ أمر .اغنية يحتاج مكتبة yt-dlp.\n"
+            "ثبّتها بالأمر: pip install yt-dlp",
+            thread_id
+        )
+        return
+
+    await client.send_message(f"🔍 {user_name} ببحث عن: {query}...", thread_id)
+
+    # نحمل الصوت مباشرة كـ m4a من يوتيوب بدون ffmpeg
+    base_name = f"song_{int(time.time())}"
+    ydl_opts = {
+        'format': 'bestaudio[ext=m4a]/bestaudio/best',
+        'outtmpl': base_name + '.%(ext)s',
+        'quiet': True,
+        'no_warnings': True,
+        'default_search': 'ytsearch1',
+        # منع أي postprocessing يحتاج ffmpeg
+        'postprocessors': [],
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(query, download=True)
+            if 'entries' in info:
+                info = info['entries'][0]
+            title = info.get('title', 'أغنية')
+            duration = info.get('duration', 0)
+            ext = info.get('ext', 'm4a')
+
+        # نلاقي الملف اللي اتحمّل فعلياً
+        actual_file = base_name + '.' + ext
+        if not os.path.exists(actual_file):
+            # ندور على أي ملف بيبدأ بنفس الاسم
+            for f in os.listdir('.'):
+                if f.startswith(base_name + '.'):
+                    actual_file = f
+                    break
+
+        if not os.path.exists(actual_file):
+            await client.send_message("❌ فشل تحميل الأغنية، جرب تاني!", thread_id)
+            return
+
+        # Check file size (Facebook limit ~25MB)
+        file_size = os.path.getsize(actual_file)
+        if file_size > 25 * 1024 * 1024:
+            await client.send_message(
+                "❌ الأغنية كبيرة جدًا (أكتر من 25 ميجا).\n"
+                "جرب تكتب اسم أغنية أقصر.",
+                thread_id
+            )
+            os.remove(actual_file)
+            return
+
+        duration_str = f"{duration//60}:{duration%60:02d}" if duration else "؟"
+        await client.send_message(
+            text=f"🎵 {user_name} طلب: {title} ({duration_str})",
+            thread_id=thread_id,
+            file_path=[actual_file]
+        )
+        os.remove(actual_file)
+
+    except Exception as e:
+        err = str(e)
+        # لو الخطأ من ffmpeg نبعت رسالة واضحة
+        if "ffprobe" in err.lower() or "ffmpeg" in err.lower():
+            await client.send_message(
+                "⚠️ محتاج تثبيت ffmpeg على السيرفر.\n"
+                "جرب تكتب في التيرمنال:\n"
+                "sudo apt update && sudo apt install ffmpeg -y",
+                thread_id
+            )
+        else:
+            await client.send_message(
+                f"❌ حدث خطأ أثناء البحث/التحميل: {err[:200]}",
+                thread_id
+            )
+        # Clean up
+        for f in os.listdir('.'):
+            if f.startswith(base_name):
+                try:
+                    os.remove(f)
+                except:
+                    pass
+
+# ==================== فيديو (تحميل وإرسال من يوتيوب) ====================
+async def game_video(client, thread_id, query, user_name):
+    if not query:
+        await client.send_message(
+            "⚠️ اكتب اسم الفيديو أو رابط!\n"
+            "مثال: .فيديو أهداف الأهلي اليوم\n"
+            "أو: .فيديو https://youtube.com/watch?v=...\n"
+            "أو: .فيديو https://twitter.com/...\n"
+            "أو: .فيديو https://instagram.com/...\n"
+            "أو: .فيديو https://tiktok.com/...",
+            thread_id
+        )
+        return
+    if not YTDLP_AVAILABLE:
+        await client.send_message(
+            "⚠️ أمر .فيديو يحتاج مكتبة yt-dlp.\n"
+            "ثبّتها بالأمر: pip install yt-dlp",
+            thread_id
+        )
+        return
+
+    # نحدد إذا المستخدم بعت رابط مباشر ولا اسم للبحث
+    query_stripped = query.strip()
+    is_url = query_stripped.startswith(('http://', 'https://'))
+
+    base_name = f"video_{int(time.time())}"
+    video_url = None
+    title = "فيديو"
+    duration = 0
+
+    # ========== لو رابط مباشر ==========
+    if is_url:
+        video_url = query_stripped
+        await client.send_message(f"🔍 {user_name} بيحمل من الرابط...", thread_id)
+        # نجيب العنوان بس (بدون تحميل)
+        try:
+            with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True, 'skip_download': True}) as ydl:
+                info = ydl.extract_info(video_url, download=False)
+                title = info.get('title', 'فيديو')
+                duration = info.get('duration', 0)
+        except Exception:
+            pass
+
+    # ========== لو اسم للبحث ==========
+    else:
+        await client.send_message(f"🔍 {user_name} ببحث عن: {query}...", thread_id)
+        search_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'default_search': 'ytsearch1',
+            'extract_flat': False,
+            'skip_download': True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(search_opts) as ydl:
+                info = ydl.extract_info(query, download=False)
+                if 'entries' in info:
+                    info = info['entries'][0]
+                title = info.get('title', 'فيديو')
+                duration = info.get('duration', 0)
+                video_url = info.get('webpage_url') or info.get('url')
+                vid = info.get('id', '')
+                if vid and not video_url:
+                    video_url = f"https://youtube.com/watch?v={vid}"
+        except Exception as e:
+            await client.send_message(
+                f"❌ فشل البحث: {str(e)[:200]}",
+                thread_id
+            )
+            return
+
+    # ========== التحميل ==========
+    if not video_url:
+        await client.send_message("❌ ملقتش رابط للفيديو.", thread_id)
+        return
+
+    ydl_opts = {
+        'format': 'worst[ext=mp4]/worst/best[ext=mp4]/best',
+        'outtmpl': base_name + '.%(ext)s',
+        'quiet': True,
+        'no_warnings': True,
+        'merge_output_format': 'mp4',
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.extract_info(video_url, download=True)
+
+        # نلاقي الملف
+        actual_file = None
+        for f in os.listdir('.'):
+            if f.startswith(base_name + '.'):
+                actual_file = f
+                break
+
+        if not actual_file or not os.path.exists(actual_file):
+            await client.send_message(
+                f"🎬 {user_name} طلب: {title}\n"
+                f"⚠️ الفيديو ده مش متاح للتحميل (محمي).\n"
+                f"🔗 {video_url}\n"
+                f"👆 اضغط على الرابط لمشاهدته.",
+                thread_id
+            )
+            return
+
+        # Check file size
+        file_size = os.path.getsize(actual_file)
+        if file_size > 25 * 1024 * 1024:
+            await client.send_message(
+                f"🎬 {user_name} طلب: {title}\n"
+                f"⚠️ الفيديو كبير جدًا (أكتر من 25 ميجا).\n"
+                f"🔗 {video_url}\n"
+                f"👆 اضغط على الرابط لمشاهدته.",
+                thread_id
+            )
+            os.remove(actual_file)
+            return
+
+        duration_str = f"{duration//60}:{duration%60:02d}" if duration else "؟"
+        await client.send_message(
+            text=f"🎬 {user_name} طلب: {title} ({duration_str})",
+            thread_id=thread_id,
+            file_path=[actual_file]
+        )
+        os.remove(actual_file)
+
+    except Exception as e:
+        err = str(e)
+        await client.send_message(
+            f"🎬 {user_name} طلب: {title}\n"
+            f"⚠️ الفيديو ده مش متاح للتحميل.\n"
+            f"🔗 {video_url}\n"
+            f"👆 اضغط على الرابط لمشاهدته.",
+            thread_id
+        )
+        for f in os.listdir('.'):
+            if f.startswith(base_name):
+                try:
+                    os.remove(f)
+                except:
+                    pass
+
+
+# ==================== تحميل (تحميل فيديو من رابط مباشر) ====================
+# ==================== 🎬 تحسين أوامر التحميل ====================
+
+def _find_ffmpeg():
+    """يبحث عن ffmpeg في النظام"""
+    import shutil
+    ffmpeg_path = shutil.which('ffmpeg')
+    if ffmpeg_path:
+        return ffmpeg_path
+    # نبحث في مسارات شائعة
+    for path in ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/opt/homebrew/bin/ffmpeg']:
+        if os.path.exists(path):
+            return path
+    return None
+
+FFMPEG_PATH = _find_ffmpeg()
+FFMPEG_AVAILABLE = FFMPEG_PATH is not None
+
+async def _compress_video(input_file, output_file, target_size_mb=20):
+    """يضغط الفيديو باستخدام ffmpeg لتقليل الحجم"""
+    if not FFMPEG_AVAILABLE:
+        return False
+    try:
+        import subprocess
+        # حساب bitrate المستهدف
+        duration_cmd = [FFMPEG_PATH, '-i', input_file, '-hide_banner']
+        result = subprocess.run(duration_cmd, capture_output=True, text=True)
+        # استخراج المدة
+        duration = 0
+        for line in result.stderr.split('\n'):
+            if 'Duration' in line:
+                time_str = line.split('Duration: ')[1].split(',')[0]
+                h, m, s = time_str.split(':')
+                duration = int(h) * 3600 + int(m) * 60 + float(s)
+                break
+        if duration == 0:
+            duration = 60  # افتراضي
+        target_bits = (target_size_mb * 8 * 1024 * 1024) / duration
+        video_bitrate = int(target_bits * 0.85)
+        audio_bitrate = min(128000, int(target_bits * 0.15))
+
+        cmd = [
+            FFMPEG_PATH, '-y', '-i', input_file,
+            '-c:v', 'libx264', '-b:v', f'{video_bitrate}',
+            '-c:a', 'aac', '-b:a', f'{audio_bitrate}',
+            '-movflags', '+faststart',
+            '-preset', 'ultrafast',
+            '-threads', '2',
+            output_file
+        ]
+        subprocess.run(cmd, capture_output=True, timeout=300)
+        return os.path.exists(output_file) and os.path.getsize(output_file) > 0
+    except Exception:
+        return False
+
+async def _download_with_ytdlp(url, base_name, audio_only=False):
+    """يحمل باستخدام yt-dlp مع خيارات متعددة"""
+    if audio_only:
+        ydl_opts = {
+            'format': 'bestaudio[ext=m4a]/bestaudio/best',
+            'outtmpl': base_name + '.%(ext)s',
+            'quiet': True,
+            'no_warnings': True,
+            'postprocessors': [],
+        }
+    else:
+        ydl_opts = {
+            'format': 'best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/worst[ext=mp4]/worst',
+            'outtmpl': base_name + '.%(ext)s',
+            'quiet': True,
+            'no_warnings': True,
+            'merge_output_format': 'mp4',
+            'postprocessors': [],
+        }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            title = info.get('title', 'فيديو')
+            duration = info.get('duration', 0)
+
+        # نلاقي الملف
+        actual_file = None
+        actual_ext = None
+        for f in sorted(os.listdir('.'), key=lambda x: os.path.getmtime(os.path.join('.', x)), reverse=True):
+            if f.startswith(base_name + '.'):
+                actual_file = f
+                actual_ext = f.split('.')[-1]
+                break
+
+        return actual_file, title, duration, actual_ext
+    except Exception as e:
+        return None, str(e), 0, None
+
+async def game_download_video(client, thread_id, url, user_name):
+    """يحمل فيديو/صوت/صورة من أي رابط مباشر — نسخة محسّنة"""
+    if not url.startswith(('http://', 'https://')):
+        await client.send_message("❌ الرابط غير صالح! لازم يبدأ بـ http:// أو https://", thread_id)
+        return
+
+    if not YTDLP_AVAILABLE:
+        await client.send_message(
+            "⚠️ أمر .تحميل يحتاج مكتبة yt-dlp.\n"
+            "ثبّتها بالأمر: pip install yt-dlp",
+            thread_id
+        )
+        return
+
+    await client.send_message(f"⏳ {user_name} جاري تحليل الرابط...", thread_id)
+
+    base_name = f"dl_{int(time.time())}"
+    downloaded_files = []
+
+    try:
+        # ====== الخطوة 1: جلب معلومات الرابط ======
+        try:
+            with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True, 'skip_download': True}) as ydl:
+                info = ydl.extract_info(url, download=False)
+                title = info.get('title', 'ملف')
+                duration = info.get('duration', 0)
+                is_video = info.get('vcodec', 'none') != 'none'
+                is_audio = info.get('acodec', 'none') != 'none'
+                filesize_approx = info.get('filesize_approx', 0) or info.get('filesize', 0)
+        except Exception:
+            title = "ملف"
+            duration = 0
+            is_video = True
+            is_audio = True
+            filesize_approx = 0
+
+        # ====== الخطوة 2: تحديد نوع التحميل ======
+        duration_str = f"{duration//60}:{duration%60:02d}" if duration else "؟"
+
+        # لو الرابط صورة مباشرة
+        if any(url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
+            await client.send_message(f"🖼️ {user_name} بيحمل صورة...", thread_id)
+            headers = {"User-Agent": "Mozilla/5.0"}
+            async with aiohttp.ClientSession(headers=headers) as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status == 200:
+                        data = await resp.read()
+                        ext = url.split('.')[-1].split('?')[0]
+                        img_file = f"{base_name}.{ext}"
+                        with open(img_file, 'wb') as f:
+                            f.write(data)
+                        await client.send_message(
+                            text=f"🖼️ {user_name} حمل صورة",
+                            thread_id=thread_id, file_path=[img_file]
+                        )
+                        os.remove(img_file)
+                        return
+                    else:
+                        await client.send_message(f"❌ فشل تحميل الصورة (كود {resp.status})", thread_id)
+                        return
+
+        # لو الرابط صوتي فقط أو المستخدم طلب صوت
+        if not is_video and is_audio:
+            await client.send_message(f"🎵 {user_name} بيحمل صوت... ({duration_str})", thread_id)
+            actual_file, title, duration, ext = await _download_with_ytdlp(url, base_name, audio_only=True)
+            if actual_file:
+                file_size = os.path.getsize(actual_file)
+                if file_size > 25 * 1024 * 1024:
+                    await client.send_message(
+                        f"⚠️ الملف الصوتي كبير جدًا ({file_size//(1024*1024)} ميجا).\n"
+                        f"🔗 {url}", thread_id
+                    )
+                else:
+                    await client.send_message(
+                        text=f"🎵 {user_name} حمل: {title} ({duration_str})",
+                        thread_id=thread_id, file_path=[actual_file]
+                    )
+                os.remove(actual_file)
+                return
+
+        # ====== الخطوة 3: تحميل الفيديو ======
+        await client.send_message(f"🎬 {user_name} بيحمل فيديو... ({duration_str})", thread_id)
+
+        # محاولة 1: تحميل فيديو بجودة منخفضة
+        actual_file, title, duration, ext = await _download_with_ytdlp(url, base_name, audio_only=False)
+
+        if not actual_file:
+            # محاولة 2: تحميل صوت فقط كـ fallback
+            await client.send_message(
+                f"⚠️ الفيديو مش متاح للتحميل المباشر. جاري تحميل الصوت...", thread_id
+            )
+            actual_file, title, duration, ext = await _download_with_ytdlp(url, base_name + "_audio", audio_only=True)
+            if actual_file:
+                file_size = os.path.getsize(actual_file)
+                if file_size <= 25 * 1024 * 1024:
+                    await client.send_message(
+                        text=f"🎵 {user_name} حمل صوت: {title} ({duration_str})\n"
+"(الفيديو محمي، تم إرسال الصوت فقط)",
+                        thread_id=thread_id, file_path=[actual_file]
+                    )
+                else:
+                    await client.send_message(
+                        f"⚠️ الملف كبير جدًا ({file_size//(1024*1024)} ميجا).\n"
+                        f"🔗 {url}", thread_id
+                    )
+                os.remove(actual_file)
+                return
+            else:
+                await client.send_message(
+                    f"❌ فشل التحميل من الرابط.\n"
+                    f"🔧 الحلول الممكنة:\n"
+                    f"1. الرابط محمي (DRM) — جرب رابط تاني\n"
+                    f"2. الموقع غير مدعوم\n"
+                    f"3. جرب: pip install -U yt-dlp\n"
+                    f"🔗 {url}", thread_id
+                )
+                return
+
+        # ====== الخطوة 4: التحقق من الحجم ======
+        file_size = os.path.getsize(actual_file)
+
+        if file_size <= 25 * 1024 * 1024:
+            # حجم مناسب — نرسل مباشرة
+            await client.send_message(
+                text=f"🎬 {user_name} حمل: {title} ({duration_str})",
+                thread_id=thread_id, file_path=[actual_file]
+            )
+            os.remove(actual_file)
+            return
+
+        # ====== الخطوة 5: الضغط لو كبير ======
+        if FFMPEG_AVAILABLE:
+            await client.send_message(
+                f"⚙️ الفيديو كبير ({file_size//(1024*1024)} ميجا). جاري الضغط...", thread_id
+            )
+            compressed_file = base_name + "_compressed.mp4"
+            success = await _compress_video(actual_file, compressed_file, target_size_mb=22)
+
+            if success and os.path.exists(compressed_file):
+                compressed_size = os.path.getsize(compressed_file)
+                if compressed_size <= 25 * 1024 * 1024:
+                    await client.send_message(
+                        text=f"🎬 {user_name} حمل: {title} (مضغوط {compressed_size//(1024*1024)}MB)",
+                        thread_id=thread_id, file_path=[compressed_file]
+                    )
+                    os.remove(compressed_file)
+                    os.remove(actual_file)
+                    return
+                else:
+                    os.remove(compressed_file)
+                    await client.send_message(
+                        f"⚠️ الفيديو كبير جدًا حتى بعد الضغط ({compressed_size//(1024*1024)} ميجا).\n"
+                        f"🔗 {url}", thread_id
+                    )
+                    os.remove(actual_file)
+                    return
+            else:
+                await client.send_message(
+                    f"⚠️ فشل الضغط. الفيديو كبير جدًا ({file_size//(1024*1024)} ميجا).\n"
+                    f"🔗 {url}", thread_id
+                )
+                os.remove(actual_file)
+                return
+        else:
+            # ffmpeg مش متاح — نحاول نحمل بجودة أقل
+            await client.send_message(
+                f"⚠️ الفيديو كبير ({file_size//(1024*1024)} ميجا) وffmpeg مش متاح للضغط.\n"
+                f"🔧 ثبّت ffmpeg: sudo apt install ffmpeg -y\n"
+                f"🔗 {url}", thread_id
+            )
+            os.remove(actual_file)
+            return
+
+    except Exception as e:
+        err = str(e)
+        await client.send_message(
+            f"❌ خطأ أثناء التحميل: {err[:250]}\n"
+            f"🔧 جرب تحديث yt-dlp: pip install -U yt-dlp\n"
+            f"🔗 {url}",
+            thread_id
+        )
+    finally:
+        # تنظيف الملفات المؤقتة
+        for f in os.listdir('.'):
+            if f.startswith(base_name):
+                try:
+                    os.remove(f)
+                except:
+                    pass
+
+
+# ==================== 🎬 تحسين أمر .فيديو أيضاً ====================
+
+# ==================== ألعاب مفقودة ====================
+
+async def game_blackjack(client, thread_id, user_id, user_name):
+    """لعبة بلاك جاك بسيطة"""
+    user = get_user(user_id, user_name)
+    bet = 300
+    if user["balance"] < bet:
+        await client.send_message(f"❌ رصيدك غير كافي! تحتاج {bet} 💎", thread_id)
+        return
+    add_balance(user_id, -bet)
+    import random
+    cards = [random.randint(1, 11) for _ in range(2)]
+    bot_cards = [random.randint(1, 11) for _ in range(2)]
+    total = sum(cards)
+    bot_total = sum(bot_cards)
+
+    result_text = (
+        f"╭━━━━━ 🃏 بلاك جاك ━━━━━╮\n\n"
+        f"👤 {user_name}: {cards} = {total}\n"
+        f"🤖 البوت: {bot_cards} = {bot_total}\n\n"
+    )
+
+    if total > 21:
+        result_text += f"💔 انفجرت! خسرت {bet} 💎\n"
+        user["losses"] += 1
+    elif bot_total > 21 or total > bot_total:
+        prize = bet * 2
+        add_balance(user_id, prize)
+        result_text += f"🏆 فزت! +{prize} 💎\n"
+        user["wins"] += 1
+        add_xp(user_id, 15)
+    elif total == bot_total:
+        add_balance(user_id, bet)
+        result_text += f"🤝 تعادل! رجعت فلوسك\n"
+    else:
+        result_text += f"💔 خسرت! البوت فاز\n"
+        user["losses"] += 1
+
+    result_text += f"💰 رصيدك: {user['balance']} 💎\n\n╰━━━━━━━━━━━━━━━━━━╯"
+    save_users()
+    await client.send_message(result_text, thread_id)
+
+async def game_coinflip(client, thread_id, user_id, user_name):
+    """رمي عملة"""
+    user = get_user(user_id, user_name)
+    bet = 200
+    if user["balance"] < bet:
+        await client.send_message(f"❌ رصيدك غير كافي! تحتاج {bet} 💎", thread_id)
+        return
+    add_balance(user_id, -bet)
+    result = random.choice(["🪙 وجه", "🪙 كتابة"])
+    win = random.choice([True, False])
+
+    if win:
+        prize = bet * 2
+        add_balance(user_id, prize)
+        await client.send_message(
+            f"╭━━━━━ 🪙 عملة ━━━━━╮\n\n"
+            f"👤 {user_name}\n{result}\n\n"
+            f"🏆 فزت! +{prize} 💎\n"
+            f"💰 رصيدك: {user['balance']} 💎\n\n╰━━━━━━━━━━━━━━━━━━╯",
+            thread_id
+        )
+        user["wins"] += 1
+        add_xp(user_id, 10)
+    else:
+        await client.send_message(
+            f"╭━━━━━ 🪙 عملة ━━━━━╮\n\n"
+            f"👤 {user_name}\n{result}\n\n"
+            f"💔 خسرت {bet} 💎\n"
+            f"💰 رصيدك: {user['balance']} 💎\n\n╰━━━━━━━━━━━━━━━━━━╯",
+            thread_id
+        )
+        user["losses"] += 1
+    save_users()
+
+async def game_dice(client, thread_id, user_id, user_name):
+    """رمي نرد"""
+    user = get_user(user_id, user_name)
+    bet = 150
+    if user["balance"] < bet:
+        await client.send_message(f"❌ رصيدك غير كافي! تحتاج {bet} 💎", thread_id)
+        return
+    add_balance(user_id, -bet)
+    dice = random.randint(1, 6)
+    bot_dice = random.randint(1, 6)
+
+    result_text = (
+        f"╭━━━━━ 🎲 نرد ━━━━━╮\n\n"
+        f"👤 {user_name}: {dice}\n"
+        f"🤖 البوت: {bot_dice}\n\n"
+    )
+
+    if dice > bot_dice:
+        prize = 500
+        add_balance(user_id, prize)
+        result_text += f"🏆 فزت! +{prize} 💎\n"
+        user["wins"] += 1
+        add_xp(user_id, 12)
+    elif dice == bot_dice:
+        add_balance(user_id, bet)
+        result_text += f"🤝 تعادل! رجعت فلوسك\n"
+    else:
+        result_text += f"💔 خسرت! البوت فاز\n"
+        user["losses"] += 1
+
+    result_text += f"💰 رصيدك: {user['balance']} 💎\n\n╰━━━━━━━━━━━━━━━━━━╯"
+    save_users()
+    await client.send_message(result_text, thread_id)
+
+async def game_my_group_info(client, thread_id):
+    """معلومات المجموعة"""
+    try:
+        info_tuple = await client.fetch_thread_info([thread_id])
+        if info_tuple and len(info_tuple) > 0:
+            info = info_tuple[0]
+            name = getattr(info, 'name', 'بدون اسم')
+            participants = getattr(info, 'participant_count', 'غير معروف')
+            await client.send_message(
+                f"╭━━━━━ 📊 مجموعتي ━━━━━╮\n\n"
+                f"📝 الاسم: {name}\n"
+                f"🆔 المعرف: {thread_id}\n"
+                f"👥 الأعضاء: {participants}\n\n"
+                f"╰━━━━━━━━━━━━━━━━━━╯",
+                thread_id
+            )
+        else:
+            await client.send_message("❌ تعذر جلب معلومات المجموعة", thread_id)
+    except Exception as e:
+        await client.send_message(f"❌ خطأ: {str(e)[:200]}", thread_id)
+
+async def on_message(message: Message):
+    print("وصلت:", message.text)
+
+    global _season_watcher_started
+    if not _season_watcher_started:
+        _season_watcher_started = True
+        asyncio.create_task(season_watcher_loop(client))
+
+    text = (message.text or "").strip()
+    thread_id = message.thread_id
+    sender_id = message.sender_id
+    
+    # مفيش أي محاولة جلب اسم من فيسبوك خالص (لا كنية ولا fetch_user_info) —
+    # بنعتمد بس على الاسم المحفوظ عندنا من قبل، أو نص عام لو أول مرة
+    existing = users_data.get(str(sender_id), {}).get("name")
+    if existing and existing != "مستخدم":
+        full_name = existing
+        sender_name = existing.split()[0]
+    else:
+        sender_name = "مستخدم"
+        full_name = "مستخدم"
+
+    get_user(sender_id, sender_name)
+
+    # ====== ردود على رسائل البوت (شراء / مغامرة حربية / أوامر بالرد) ======
+    replied_id = None
+    replied_sender_id = None
+    replied_msg = None
+
+    # fbchat_muqit بيستخدم اسمين مختلفين للرد
+    if hasattr(message, 'reply_to_message') and message.reply_to_message:
+        replied_msg = message.reply_to_message
+        replied_id = replied_msg.id
+        replied_sender_id = getattr(replied_msg, 'sender_id', None)
+    elif hasattr(message, 'replied_to_message') and message.replied_to_message:
+        replied_msg = message.replied_to_message
+        replied_id = replied_msg.id
+        replied_sender_id = getattr(replied_msg, 'sender_id', None)
+    elif hasattr(message, 'reply_to') and message.reply_to:
+        replied_msg = message.reply_to
+        replied_id = replied_msg.id
+        replied_sender_id = getattr(replied_msg, 'sender_id', None)
+
+    is_reply_to_bot = (str(replied_sender_id) == str(client.uid)) if replied_sender_id else False
+
+
+    if replied_id:
+        # تأكد إن replied_id string
+        replied_id = str(replied_id)
+        # أولوية: ردود المتجر (أرقام فقط)
+        if replied_id in shop_message_ids and text.strip().isdigit():
+            await game_buy(client, thread_id, sender_id, sender_name, text.strip())
+            return
+
+        # ردود المغامرة الحربية (أرقام 1-3)
+        if replied_id in war_adventures:
+            handled = await handle_war_adventure_reply(client, thread_id, sender_id, sender_name, replied_id, text)
+            if handled:
+                return
+
+        # ردود مغامرة السلوتس (أرقام 1-3)
+        if replied_id in slots_adventures:
+            handled = await handle_slots_adventure_reply(client, thread_id, sender_id, sender_name, replied_id, text)
+            if handled:
+                return
+            handled = await handle_war_adventure_reply(client, thread_id, sender_id, sender_name, replied_id, text)
+            if handled:
+                return
+
+        # ====== أوامر الرد على رسائل البوت ======
+        if is_reply_to_bot:
+            # .احذف — رد على رسالة البوت لحذفها
+            if text == ".احذف":
+                try:
+                    await client.react(reaction="❤️", message_id=message.id, thread_id=thread_id)
+                    await client.unsend(message_id=replied_id, thread_id=thread_id)
+                except Exception as e:
+                    await client.send_message(f"❌ خطأ في الحذف: {str(e)[:150]}", thread_id)
+                return
+
+            # .حرب — رد على رسالة البوت لبدء مغامرة فردية
+            if text == ".حرب":
+                await start_war_adventure(client, thread_id, sender_id, sender_name)
+                return
+
+    # ====== fallback: لو المستخدم كتب رقم بس والمغامرة نشطة ======
+    # (بعض نسخ فيسبوك موبايل مبتدعمش الرد بشكل صحيح)
+    if text.strip() in ("1", "2", "3", "١", "٢", "٣"):
+        # ندور على مغامرة حربية نشطة
+        for msg_id, state in list(war_adventures.items()):
+            if state.get("user_id") == str(sender_id):
+                handled = await handle_war_adventure_reply(
+                    client, thread_id, sender_id, sender_name, msg_id, text
+                )
+                if handled:
+                    return
+        # ندور على مغامرة سلوتس نشطة
+        for msg_id, state in list(slots_adventures.items()):
+            if state.get("user_id") == str(sender_id):
+                handled = await handle_slots_adventure_reply(
+                    client, thread_id, sender_id, sender_name, msg_id, text
+                )
+                if handled:
+                    return
+
+    # لعبة إكس أو
+    if thread_id in active_xo_games:
+        handled = await handle_xo_move(client, thread_id, sender_id, sender_name, text)
+        if handled:
+            return
+
+    # ==================== جميع الأوامر ====================
+    
+    # ℹ️ أوامر عامة
+    if text == ".بوت":
+        await client.send_message(
+            f"╭━━━━━━━━━━━━━━━━━━━━━━╮\n"
+            f"┃   🤖 {BOT_NAME}   ┃\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
+            f"👨‍💻 {DEV_NAME}\n\n"
+            f"╭━━━━━━ ❰ 💰 الإقتصاد ❱ ━━━━━━╮\n"
+            f"│ 💎 .رصيد | 🏆 .توب | 🎁 .يومي\n"
+            f"│ 💳 .تحويل [رابط الحساب] [مبلغ]\n"
+            f"│ 🔨 .مزاد [سعر] [وصف] | .مزايدة [مبلغ]\n"
+            f"│ 🏆 .الموسم — ترتيب شهري بمكافآت\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
+            f"╭━━━━━━ ❰ 🎮 الألعاب ❱ ━━━━━━╮\n"
+            f"│ .حظ (100) | .سلوتس (200) | .بلاك (300)\n"
+            f"│ .عملة (200) | .نرد (150) | .صراحة (مجاني)\n"
+            f"│ .رهان [@mention؟] (300) | .حرب (350) — مغامرة حربية تفاعلية\n"
+            f"│ .اكس او @mention (مجاني)\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
+            f"╭━━━━━━ ❰ 🎲 محتوى ❱ ━━━━━━╮\n"
+            f"│ .نكتة | .اقتباس | .معلومة\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
+
+            f"╭━━━━━━ ❰ 📊 أدوات المجموعة ❱ ━━━━━━╮\n"
+            f"│ .تصويت السؤال | خيار1 | خيار2\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
+            f"╭━━━━━━ ❰ 🛒 المتجر ❱ ━━━━━━╮\n"
+            f"│ .متجر | .شراء [رقم]\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
+            f"╭━━━━━━ ❰ 📖 معلومات وخدمات ❱ ━━━━━━╮\n"
+            f"│ .ويكي [كلمة] | .ترجم [كود] [نص]\n"
+            f"│ .طقس [مدينة]\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
+            f"╭━━━━━━ ❰ 🎙️ الصوت والصور ❱ ━━━━━━╮\n"
+            f"│ .قولي [نص] — يحول النص لرسالة صوتية\n"
+            f"│ .صورة [اسم] — يرسل 5 صور بحسب طلبك\n"
+            f"│ .اغنية [اسم] — يبحث ويرسل الأغنية من يوتيوب\n"
+            f"│ .فيديو [اسم] — يبحث ويرسل الفيديو من يوتيوب\n"
+            f"│ .تحميل [رابط] — يحمل فيديو من رابط مباشر\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
+            f"╭━━━━━━ ❰ 📊 المجموعة ❱ ━━━━━━╮\n"
+            f"│ .مجموعتي — معلومات كاملة عن المجموعة\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
+            f"╭━━━━━━ ❰ 👤 الحساب ❱ ━━━━━━╮\n"
+            f"│ .حسابي | .مستوى\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
+            f"╭━━━━━━ ❰ 🗑️ عام ❱ ━━━━━━╮\n"
+            f"│ .احذف — رد على رسالة البوت لحذفها\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
+            f"╭━━━━━━ ❰ 👥 الإدارة ❱ ━━━━━━╮\n"
+            f"│ .اضف | .ازالة | .انذار | .طرد\n"
+            f"│ .اسم المجموعة\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
+            f"╭━━━━━━ ❰ 👑 المطور ❱ ━━━━━━╮\n"
+            f"│ .غادر | .اشعار [نص] | .المجموعات\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
+            f"💡 .العاب | .رصيد | .توب",
+            thread_id
+        )
+
+    elif text == ".المطور":
+        await client.send_message(
+            f"╭━━━━━ 👨‍💻 المطور ━━━━━╮\n\n👤 {DEV_NAME}\n🔗 {DEV_PROFILE_URL}\n🆔 {DEV_ID}\n\n╰━━━━━━━━━━━━━━━━━━╯",
+            thread_id
+        )
+
+    elif text == ".احذف":
+        # تم نقل منطق الرد على رسائل البوت لأعلى (قبل الأوامر)
+        # هنا نتعامل فقط مع الاستخدام بدون رد
+        await client.send_message("🗑️ رد على رسالة البوت بـ .احذف", thread_id)
+
+    # 👤 أوامر الحساب
+    elif text == ".حسابي":
+        # نجيب الاسم من فيسبوك عشان يظهر صح
+        display_name = full_name
+        try:
+            ui = await client.fetch_user_info(sender_id)
+            if ui and ui.name:
+                display_name = ui.name
+                # نحفظ الاسم عشان المرات الجاية
+                get_user(sender_id, display_name)
+        except Exception:
+            pass
+
+        u = get_user(sender_id, display_name)
+        xp = u.get("xp", 0)
+        level = get_level(xp)
+        title = u.get("title") or "بدون لقب"
+        text_summary = (
+            f"╭━━━━━ 📋 حسابك ━━━━━╮\n\n"
+            f"👤 الاسم: {display_name}\n🆔 المعرف: {sender_id}\n"
+            f"🎖️ اللقب: {title}\n⭐ المستوى: {level} ({xp} XP)\n"
+            f"💎 الرصيد: {u['balance']}\n🎮 الألعاب: {u['games_played']}\n"
+            f"🏆 الفوز: {u['wins']}\n💔 الخسارة: {u['losses']}\n"
+            f"⚠️ الإنذارات: {u.get('warnings', 0)}\n🔗 الرابط: fb.com/{sender_id}\n\n╰━━━━━━━━━━━━━━━━━━╯"
+        )
+
+        card_bytes = generate_profile_card(u, display_name)
+        if card_bytes:
+            filename = f"profile_card_{sender_id}_{int(time.time())}.png"
+            with open(filename, "wb") as f:
+                f.write(card_bytes)
+            try:
+                await client.send_message(text=text_summary, thread_id=thread_id, file_path=[filename])
+            finally:
+                if os.path.exists(filename):
+                    os.remove(filename)
+        else:
+            await client.send_message(text_summary, thread_id)
+
+    elif text == ".مستوى":
+        u = get_user(sender_id, sender_name)
+        xp = u.get("xp", 0)
+        level, into_level, needed = get_level_progress(xp)
+        bar_filled = int((into_level / needed) * 10)
+        bar = "🟩" * bar_filled + "⬜" * (10 - bar_filled)
+        boost_active = time.time() < u.get("xp_boost_until", 0)
+        boost_line = "\n⚡ مضاعف الخبرة شغال!" if boost_active else ""
+
+        text_summary = (
+            f"╭━━━━━ ⭐ المستوى ━━━━━╮\n\n"
+            f"⭐ المستوى: {level}\n"
+            f"{bar}\n{into_level}/{needed} XP لغاية المستوى الجاي{boost_line}\n\n╰━━━━━━━━━━━━━━━━━━╯"
+        )
+
+        card_bytes = generate_level_card(u, full_name)
+        if card_bytes:
+            filename = f"level_card_{sender_id}_{int(time.time())}.png"
+            with open(filename, "wb") as f:
+                f.write(card_bytes)
+            try:
+                await client.send_message(text=text_summary, thread_id=thread_id, file_path=[filename])
+            finally:
+                if os.path.exists(filename):
+                    os.remove(filename)
+        else:
+            await client.send_message(text_summary, thread_id)
+    elif text == ".يومي":
+        u = get_user(sender_id, sender_name)
+        today = datetime.now().strftime("%Y-%m-%d")
+        if u.get("last_daily") == today:
+            await client.send_message("⚠️ استلمت مكافأتك اليومية! تعال بكرة ⏰", thread_id)
+            return
+        bonus = random.randint(200, 1000)
+        add_balance(sender_id, bonus)
+        u["last_daily"] = today
+        save_users()
+        await client.send_message(
+            f"╭━━━━━ 🎁 مكافأة ━━━━━╮\n\n👤 {sender_name}\n🎁 +{bonus} 💎\n💰 رصيدك: {u['balance']}\n\n╰━━━━━━━━━━━━━━━━━━╯",
+            thread_id
+        )
+
+    elif text.startswith(".تحويل"):
+        parts = text.split(" ")
+        if len(parts) < 3:
+            await client.send_message("❌ استخدام: .تحويل [رابط الحساب] [المبلغ]\nمثال: .تحويل facebook.com/xxx 500", thread_id)
+            return
+        try:
+            amount = int(parts[-1])
+        except:
+            await client.send_message("❌ مبلغ غير صالح!", thread_id)
+            return
+        if amount <= 0:
+            await client.send_message("❌ المبلغ يجب أن يكون أكبر من صفر!", thread_id)
+            return
+
+        link = " ".join(parts[1:-1]).strip()
+        target_id = None
+        if "facebook.com" in link or "fb.com" in link:
+            extracted = extract_uid_from_url(link)
+            if extracted:
+                if extracted.isdigit():
+                    target_id = extracted
+                else:
+                    try:
+                        ui = await client.fetch_user_info(extracted)
+                        if ui:
+                            target_id = ui.uid
+                    except:
+                        pass
+        elif link.isdigit():
+            target_id = link
+
+        if not target_id:
+            await client.send_message("❌ رابط الحساب غير صالح!\nاستخدام: .تحويل [رابط الحساب] [المبلغ]", thread_id)
+            return
+
+        target_name = "المستخدم"
+        try:
+            ui = await client.fetch_user_info(target_id)
+            if ui:
+                target_name = ui.name.split()[0]
+        except:
+            pass
+        if str(target_id) == str(sender_id):
+            await client.send_message("❌ ما ينفعش تحول لنفسك!", thread_id)
+            return
+        u1 = get_user(sender_id, sender_name)
+        if u1["balance"] < amount:
+            await client.send_message(f"❌ رصيدك غير كافي! ({u1['balance']} 💎)", thread_id)
+            return
+        add_balance(sender_id, -amount)
+        add_balance(target_id, amount)
+        u2 = get_user(target_id, target_name)
+        await client.send_message(
+            f"╭━━━━━ 💳 تحويل ━━━━━╮\n\n"
+            f"👤 من: {sender_name}\n👤 إلى: {target_name}\n💎 المبلغ: {amount}\n\n"
+            f"💰 رصيدك: {u1['balance']}\n💰 رصيده: {u2['balance']}\n\n╰━━━━━━━━━━━━━━━━━━╯",
+            thread_id
+        )
+
+    elif text.startswith(".رصيد"):
+        mentions = getattr(message, 'mentions', [])
+        if mentions:
+            target_id = mentions[0]
+            target_name = "المستخدم"
+            try:
+                ui = await client.fetch_user_info(target_id)
+                if ui:
+                    target_name = ui.name.split()[0]
+            except:
+                pass
+            u = get_user(target_id, target_name)
+            await client.send_message(
+                f"╭━━━━━ 💰 رصيد ━━━━━╮\n\n👤 {target_name}\n💎 {u['balance']} | 🎮 {u['games_played']}\n🏆 {u['wins']} | 💔 {u['losses']}\n\n╰━━━━━━━━━━━━━━━━━━╯",
+                thread_id
+            )
+        else:
+            u = get_user(sender_id, sender_name)
+            await client.send_message(
+                f"╭━━━━━ 💰 رصيدك ━━━━━╮\n\n👤 {sender_name}\n💎 {u['balance']} | 🎮 {u['games_played']}\n🏆 {u['wins']} | 💔 {u['losses']}\n📈 {u['total_earned']} | 📉 {u['total_lost']}\n\n╰━━━━━━━━━━━━━━━━━━╯",
+                thread_id
+            )
+
+    elif text == ".توب":
+        sorted_users = sorted(users_data.items(), key=lambda x: x[1]["balance"], reverse=True)[:5]
+        if not sorted_users:
+            await client.send_message("❌ لا يوجد لاعبين!", thread_id)
+            return
+        report = "╭━━━━━ 🏆 التوب ━━━━━╮\n\n"
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        for i, (uid, data) in enumerate(sorted_users):
+            report += f"{medals[i]} {data.get('name', 'مجهول')}\n   └ 💎 {data['balance']} نقطة\n\n"
+        report += "╰━━━━━━━━━━━━━━━━━━╯"
+        await client.send_message(report, thread_id)
+
+    # 🔨 المزاد (تبادل بين الأعضاء)
+    elif text.startswith(".مزاد"):
+        parts = text.replace(".مزاد", "", 1).strip().split(" ", 1)
+        if len(parts) < 2 or not parts[0].isdigit() or not parts[1].strip():
+            await client.send_message(
+                "❌ استخدام: .مزاد [السعر الابتدائي] [الوصف]\nمثال: .مزاد 500 تصميم لوجو ليك",
+                thread_id
+            )
+            return
+        await game_auction_start(client, thread_id, sender_id, sender_name, int(parts[0]), parts[1].strip())
+
+    elif text.startswith(".مزايدة"):
+        amount_str = text.replace(".مزايدة", "", 1).strip()
+        if not amount_str:
+            await client.send_message("❌ استخدام: .مزايدة [مبلغ]", thread_id)
+            return
+        await game_bid(client, thread_id, sender_id, sender_name, amount_str)
+
+    # 🏆 الموسم
+    elif text == ".الموسم":
+        ranked = sorted(users_data.items(), key=lambda x: x[1].get("season_points", 0), reverse=True)[:5]
+        days_left = get_season_days_left()
+        body = f"╭━━━━━ 🏆 الموسم {season_data.get('season_number', 1)} ━━━━━╮\n\n⏳ متبقي {days_left} يوم\n\n"
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        if not ranked or all(d.get("season_points", 0) == 0 for _, d in ranked):
+            body += "لسه محدش جمع نقاط في الموسم ده!\n"
+        else:
+            for i, (uid, data) in enumerate(ranked):
+                body += f"{medals[i]} {data.get('name', 'مجهول')} — {data.get('season_points', 0)} نقطة\n"
+        body += "\n💡 نقاط الموسم بتتجمع من أي ربح في الألعاب، وبتتصفر كل شهر مع مكافآت للأوائل!\n\n╰━━━━━━━━━━━━━━━━━━╯"
+        await client.send_message(body, thread_id)
+
+    # 🎮 أوامر الألعاب
+    elif text == ".العاب":
+        u = get_user(sender_id, sender_name)
+        await client.send_message(
+                        f"╭━━━━━ 🎮 الألعاب ━━━━━╮\n\n"
+            f"💳 رصيدك: {u['balance']} 💎\n\n"
+            f"🎰 .حظ       │ 100💎 │ 🎁 حتى 5000\n"
+            f"🎲 .سلوتس    │ 200💎 │ 🎁 حتى 10000\n"
+            f"🃏 .بلاك     │ 300💎 │ 🎁 حتى 3000\n"
+            f"🪙 .عملة     │ 200💎 │ 🎁 400\n"
+            f"🎲 .نرد      │ 150💎 │ 🎁 500\n"
+            f"🔮 .صراحة    │ مجاني │ ❓ سؤال\n"
+            f"🤝 .رهان     │ 300💎 │ ⚔️ فردي أو ضد صديق\n"
+            f"⚔️ .حرب      │ 350💎 │ 🔥💧🌍 فردي أو ضد صديق\n"
+            f"❌⭕ .اكس او   │ مجاني │ ⚔️ ضد صديق\n\n"
+            f"╰━━━━━━━━━━━━━━━━━━╯",
+            thread_id
+        )
+
+    elif text == ".حظ":
+        await game_luck(client, thread_id, sender_id, sender_name)
+
+    elif text == ".سلوتس":
+        await game_slots(client, thread_id, sender_id, sender_name)
+
+    elif text == ".صراحة":
+        await game_dare(client, thread_id, sender_name)
+
+    elif text == ".بلاك":
+        await game_blackjack(client, thread_id, sender_id, sender_name)
+
+    elif text == ".عملة":
+        await game_coinflip(client, thread_id, sender_id, sender_name)
+
+    elif text == ".نرد":
+        await game_dice(client, thread_id, sender_id, sender_name)
+
+    elif text.startswith(".رهان"):
+        mentions = getattr(message, 'mentions', [])
+        if not mentions:
+            await game_bet_solo(client, thread_id, sender_id, sender_name)
+            return
+        player2_id = mentions[0]
+        if player2_id == sender_id:
+            await client.send_message("❌ ما ينفعش مع نفسك! 😂", thread_id)
+            return
+        player2_name = "الخصم"
+        try:
+            ui = await client.fetch_user_info(player2_id)
+            if ui:
+                player2_name = ui.name.split()[0]
+        except:
+            pass
+        await game_bet(client, thread_id, sender_id, sender_name, player2_id, player2_name)
+
+    elif text.startswith(".حرب"):
+        await start_war_adventure(client, thread_id, sender_id, sender_name)
+
+    elif text.startswith(".اكس او"):
+        mentions = getattr(message, 'mentions', [])
+        if not mentions:
+            await client.send_message("🎮 .اكس او @اسم_الشخص", thread_id)
+            return
+        player2_id = mentions[0]
+        if str(player2_id) == str(sender_id):
+            await client.send_message("❌ ما ينفعش مع نفسك! 😂", thread_id)
+            return
+        player2_name = "الخصم"
+        try:
+            ui = await client.fetch_user_info(player2_id)
+            if ui:
+                player2_name = ui.name.split()[0]
+        except:
+            pass
+        await game_xo_start(client, thread_id, sender_id, sender_name, player2_id, player2_name)
+
+    # 🎲 محتوى عشوائي
+    elif text == ".نكتة":
+        await game_mixed_content(client, thread_id, JOKES, "نكتة", "😂", fetch_online_joke)
+
+    elif text == ".اقتباس":
+        await game_mixed_content(client, thread_id, QUOTES, "اقتباس", "💬", fetch_online_quote)
+
+    elif text == ".معلومة":
+        await game_random_content(client, thread_id, FACTS, "معلومة", "💡")
+
+    # 📊 أدوات المجموعة
+    elif text.startswith(".تصويت"):
+        raw = text.replace(".تصويت", "", 1).strip()
+        await game_poll(client, thread_id, raw)
+
+    # 🛒 المتجر
+    elif text == ".متجر":
+        await game_shop(client, thread_id)
+
+    elif text.startswith(".شراء"):
+        parts = text.split(" ", 1)
+        if len(parts) < 2 or not parts[1].strip():
+            await client.send_message("⚠️ استخدام: .شراء [رقم]\nاكتب .متجر لعرض القائمة", thread_id)
+            return
+        await game_buy(client, thread_id, sender_id, sender_name, parts[1].strip())
+
+    # 📖 ويكيبيديا / 🌐 ترجمة / 🌤️ طقس
+    elif text.startswith(".ويكي"):
+        query = text.replace(".ويكي", "", 1).strip()
+        await game_wiki(client, thread_id, query)
+
+    elif text.startswith(".ترجم"):
+        parts = text.replace(".ترجم", "", 1).strip().split(" ", 1)
+        if len(parts) == 2 and re.fullmatch(r"[a-zA-Z-]{2,7}", parts[0]):
+            target_lang, content = parts[0], parts[1]
+        else:
+            target_lang, content = "en", " ".join(parts).strip()
+        await game_translate(client, thread_id, target_lang, content)
+
+    elif text.startswith(".طقس"):
+        city = text.replace(".طقس", "", 1).strip()
+        await game_weather(client, thread_id, city)
+
+    # 🎙️ أمر قولي (نص إلى صوت)
+    elif text.startswith(".قولي"):
+        speak_text = text.replace(".قولي", "", 1).strip()
+        await game_speak(client, thread_id, speak_text, sender_name)
+
+    # 🖼️ أمر صورة (بحث وإرسال 5 صور)
+    elif text.startswith(".صورة"):
+        img_query = text.replace(".صورة", "", 1).strip()
+        await game_image(client, thread_id, img_query, sender_name, count=5)
+
+    # 🎵 أمر أغنية (بحث وتحميل من يوتيوب)
+    elif text.startswith(".اغنية"):
+        song_query = text.replace(".اغنية", "", 1).strip()
+        await game_song(client, thread_id, song_query, sender_name)
+
+    # 🎬 أمر فيديو (بحث وتحميل من يوتيوب)
+    elif text.startswith(".فيديو"):
+        video_query = text.replace(".فيديو", "", 1).strip()
+        await game_video(client, thread_id, video_query, sender_name)
+
+    # 🎬 أمر تحميل (تحميل فيديو من رابط مباشر)
+    elif text.startswith(".تحميل"):
+        url = text.replace(".تحميل", "", 1).strip()
+        if not url:
+            await client.send_message(
+                "⚠️ ارسل الرابط بعد الأمر\nمثال: .تحميل https://youtube.com/watch?v=...",
+                thread_id
+            )
+            return
+        await game_download_video(client, thread_id, url, sender_name)
+
+
+    # 📊 أمر مجموعتي (معلومات المجموعة الحالية)
+    elif text == ".مجموعتي":
+        await game_my_group_info(client, thread_id)
+
+    # 👥 أوامر الإدارة
+    elif text.startswith(".انذار"):
+        if not await can_manage_group(client, thread_id, sender_id):
+            await client.send_message("❌ هذا الأمر لأدمن المجموعة أو المطور فقط!", thread_id)
+            return
+        mentions = getattr(message, 'mentions', [])
+        if not mentions:
+            await client.send_message("⚠️ استخدام: .انذار @mention", thread_id)
+            return
+        target_id = mentions[0]
+        target_name = "المستخدم"
+        try:
+            ui = await client.fetch_user_info(target_id)
+            if ui:
+                target_name = ui.name.split()[0]
+        except:
+            pass
+        u = get_user(target_id, target_name)
+        u["warnings"] = u.get("warnings", 0) + 1
+        save_users()
+        if u["warnings"] >= 3:
+            try:
+                await client.remove_participant(thread_id, target_id)
+                await client.send_message(f"🚫 {target_name} طُرد بعد 3 إنذارات!", thread_id)
+            except:
+                await client.send_message(f"⚠️ {target_name} عنده {u['warnings']} إنذارات!", thread_id)
+        else:
+            await client.send_message(
+                f"╭━━━━━ ⚠️ إنذار ━━━━━╮\n\n"
+                f"👤 {target_name}\n⚠️ الإنذارات: {u['warnings']}/3\n\n╰━━━━━━━━━━━━━━━━━━╯",
+                thread_id
+            )
+
+    elif text.startswith(".طرد"):
+        if not await can_manage_group(client, thread_id, sender_id):
+            await client.send_message("❌ هذا الأمر لأدمن المجموعة أو المطور فقط!", thread_id)
+            return
+        mentions = getattr(message, 'mentions', [])
+        parts = text.split(" ", 1)
+        target_id = None
+        if mentions:
+            target_id = mentions[0]
+        elif len(parts) > 1 and parts[1].strip().isdigit():
+            target_id = parts[1].strip()
+        if not target_id:
+            await client.send_message("🚫 .طرد @mention أو .طرد [معرف]", thread_id)
+            return
+        try:
+            await client.remove_participant(thread_id, target_id)
+            await client.send_message("🚫 تم الطرد!", thread_id)
+        except Exception as e:
+            await client.send_message(f"❌ فشل: {str(e)[:200]}", thread_id)
+
+    elif text.startswith(".ازالة"):
+        if sender_id != DEV_ID:
+            await client.send_message("❌ للمطور فقط!", thread_id)
+            return
+        mentions = getattr(message, 'mentions', [])
+        parts = text.split(" ", 1)
+        target_id = None
+        if mentions:
+            target_id = mentions[0]
+        elif len(parts) > 1 and parts[1].strip().isdigit():
+            target_id = parts[1].strip()
+        if not target_id:
+            await client.send_message("❌ .ازالة @mention أو .ازالة [معرف]", thread_id)
+            return
+        try:
+            await client.remove_participant(thread_id, target_id)
+            await client.send_message("✅ تم الإزالة!", thread_id)
+        except Exception as e:
+            await client.send_message(f"❌ فشل: {str(e)[:200]}", thread_id)
+
+    # 👑 أوامر المطور
+    elif text == ".غادر":
+        if sender_id != DEV_ID:
+            return
+        await client.react("💔", message.id, thread_id)
+        await client.remove_participant(thread_id, client.uid)
+
+    # ======== أمر الإشعار المزخرف (للمطور فقط) ========
+    elif text.startswith(".اشعار"):
+        if sender_id != DEV_ID:
+            await client.send_message("❌ هذا الأمر للمطور فقط!", thread_id)
+            return
+
+        parts = text.split(maxsplit=1)
+
+        if len(parts) < 2 or not parts[1].strip():
+            await client.send_message(
+                "⚠️ اكتب نص الإشعار بعد الأمر، مثال: .اشعار مرحبا بالجميع",
+                thread_id
+            )
+            return
+
+        notice_text = parts[1].strip()
+        decorated = decorate_notice(notice_text)
+
+        try:
+            all_threads = await fetch_all_threads_paginated(
+                client,
+                fetch_limit=100,
+                max_pages=30
+            )
+
+            if not all_threads:
+                await client.send_message("⚠️ لم أستطع جلب أي محادثات.", thread_id)
+                return
+
+            count = 0
+
+            for thr in all_threads:
+                thread_id_attr = None
+
+                if hasattr(thr, 'id'):
+                    thread_id_attr = thr.id
+                elif hasattr(thr, 'thread_id'):
+                    thread_id_attr = thr.thread_id
+                elif hasattr(thr, 'uid'):
+                    thread_id_attr = thr.uid
+                elif hasattr(thr, 'threadId'):
+                    thread_id_attr = thr.threadId
+                elif isinstance(thr, (int, str)):
+                    thread_id_attr = thr
+                else:
+                    continue
+
+                is_group = False
+                if hasattr(thr, 'type'):
+                    t = str(thr.type).upper()
+                    is_group = "GROUP" in t
+                else:
+                    is_group = True
+
+                if is_group:
+                    try:
+                        await client.send_message(decorated, thread_id_attr)
+                        count += 1
+                        await asyncio.sleep(0.5)
+                    except Exception as e:
+                        print(f"⚠️ فشل الإرسال إلى {thread_id_attr}: {e}")
+
+            await client.send_message(
+                f"✅ تم إرسال الإشعار المزخرف إلى {count} مجموعة "
+                f"(من أصل {len(all_threads)} محادثة تم فحصها).",
+                thread_id
+            )
+
+        except Exception as e:
+            await client.send_message(f"❌ فشل جلب المجموعات: {str(e)[:200]}", thread_id)
+
+    elif text == ".اسم المجموعة":
+        try:
+            threads = await client.fetch_thread_info([thread_id])
+            if not threads:
+                await client.send_message("❌ تعذّر جلب اسم المجموعة.", thread_id)
+                return
+            await client.send_message(
+                f"╭━━━━━ 📌 المجموعة ━━━━━╮\n\n📝 {threads[0].name or 'بدون اسم'}\n🆔 {thread_id}\n\n╰━━━━━━━━━━━━━━━━━━╯",
+                thread_id
+            )
+        except Exception as e:
+            await client.send_message(f"❌ خطأ: {str(e)}", thread_id)
+
+    elif text == ".المجموعات":
+        if sender_id != DEV_ID:
+            await client.send_message("❌ هذا الأمر للمطور فقط!", thread_id)
+            return
+
+        await client.send_message("⏳ جاري الفحص...", thread_id)
+
+        try:
+            threads = await client.fetch_thread_list(limit=10)
+            report = "🔍 تقرير المجموعات:\n\n"
+            count = 0
+
+            for thr in threads:
+                try:
+                    tid = (
+                        getattr(thr, 'thread_id', None)
+                        or getattr(thr, 'id', None)
+                        or getattr(thr, 'uid', None)
+                    )
+                    if not tid:
+                        continue
+
+                    info_tuple = await client.fetch_thread_info([tid])
+                    if not info_tuple:
+                        continue
+                    info = info_tuple[0]
+
+                    report += f"📝 الاسم: {info.name}\n"
+                    report += f"🆔 معرف المجموعة: {tid}\n"
+                    report += f"👥 الأعضاء: {getattr(info, 'participant_count', 'غير معروف')}\n"
+                    report += f"📍 النوع: {thr.type}\n\n"
+
+                    count += 1
+                except Exception as e:
+                    report += f"❌ خطأ: {e}\n\n"
+
+            report += f"✅ تم فحص {count} محادثة"
+            if len(report) > 2000:
+                for i in range(0, len(report), 1900):
+                    await client.send_message(report[i:i+1900], thread_id)
+            else:
+                await client.send_message(report, thread_id)
+
+        except Exception as e:
+            await client.send_message(f"❌ خطأ: {str(e)[:200]}", thread_id)
+
+    elif text.startswith(".اضف"):
+        parts = text.split(" ", 1)
+        if len(parts) < 2:
+            await client.send_message("❌ .اضف [رابط/معرف]", thread_id)
+            return
+        target = parts[1].strip()
+        user_id = None
+        if "facebook.com" in target or "fb.com" in target:
+            extracted = extract_uid_from_url(target)
+            if not extracted:
+                await client.send_message("❌ تعذر استخراج المعرف", thread_id)
+                return
+            if not extracted.isdigit():
+                try:
+                    ui = await client.fetch_user_info(extracted)
+                    if ui:
+                        user_id = ui.uid
+                except:
+                    pass
+            else:
+                user_id = extracted
+        elif target.isdigit():
+            user_id = target
+        if not user_id:
+            await client.send_message("❌ تعذر تحديد المعرف", thread_id)
+            return
+        try:
+            await client.send_message("⏳ جاري الإضافة...", thread_id)
+            await client.add_participants(thread_id, [user_id])
+            await client.send_message("✅ تمت الإضافة!", thread_id)
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "already" in error_msg:
+                await client.send_message("⚠️ موجود بالفعل!", thread_id)
+            elif "privacy" in error_msg:
+                await client.send_message("❌ خصوصية!", thread_id)
+            elif "blocked" in error_msg:
+                await client.send_message("❌ محظور!", thread_id)
+            elif "limit" in error_msg:
+                await client.send_message("❌ حد الإضافات!", thread_id)
+            else:
+                await client.send_message(f"❌ فشل: {str(e)[:200]}", thread_id)
+
+
+    elif text == ".اضف الكل":
+        if sender_id != DEV_ID:
+            await client.send_message("❌ هذا الأمر للمطور فقط!", thread_id)
+            return
+        try:
+            all_uids = list(users_data.keys())
+            if not all_uids:
+                await client.send_message("❌ ملف المستخدمين فاضي!", thread_id)
+                return
+            await client.send_message(f"⏳ جاري إضافة {len(all_uids)} مستخدم...", thread_id)
+            added = 0
+            failed = 0
+            for uid in all_uids:
+                try:
+                    await client.add_participants(thread_id, [uid])
+                    added += 1
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    failed += 1
+            await client.send_message(
+                f"╭━━━━━ ✅ إضافة جماعية ━━━━━╮\n\n"
+                f"✅ تمت الإضافة: {added}\n"
+                f"❌ فشل: {failed}\n"
+                f"📊 الكل: {len(all_uids)}\n\n"
+                f"╰━━━━━━━━━━━━━━━━━━╯",
+                thread_id
+            )
+        except Exception as e:
+            await client.send_message(f"❌ خطأ: {str(e)[:200]}", thread_id)
+
+    # 👑 أمر اضفني (للمطور فقط) — يضيف المطور لمجموعة معينة عن طريق معرفها
+    
+
+# ==================== تشغيل البوت ====================
+client.on_message = on_message
+print("✅ البوت يعمل...")
+print(f"🤖 {BOT_NAME} | 👨‍💻 {DEV_NAME}")
+print("=" * 40)
+print("📋 الأوامر المتاحة:")
+print("💰 .رصيد | .توب | .يومي | .تحويل | .مزاد | .مزايدة | .الموسم")
+print("🎮 .حظ | .سلوتس | .بلاك | .عملة | .نرد | .صراحة | .رهان | .حرب (مغامرة) | .اكس او")
+print("🎲 .نكتة | .اقتباس | .معلومة")
+print("📊 .تصويت")
+print("🛒 .متجر | .شراء")
+print("📖 .ويكي | .ترجم | .طقس")
+print("🎙️ .قولي | .صورة | .اغنية | .فيديو")
+print("📊 .مجموعتي")
+print("👤 .حسابي | .مستوى")
+print("🗑️ .احذف")
+print("👥 .اضف | .ازالة | .انذار | .طرد | .اسم المجموعة")
+print("👑 .غادر | .اشعار [نص] | .المجموعات")
+print("=" * 40)
+
+# ==================== إعادة اتصال تلقائية عند الانقطاع ====================
+# لو الجلسة اتقطعت لأي سبب (مشكلة شبكة، فيسبوك قفل الاتصال مؤقتًا، إلخ)،
+# البوت يحاول يعيد الاتصال تلقائيًا بدل ما يوقف تمامًا ويحتاج تشغيل يدوي.
+def run_with_auto_reconnect():
+    attempt = 0
+    while True:
+        try:
+            client.run()
+            # لو client.listen() رجع عادي (من غير استثناء)، يبقى غالبًا حصل خروج مقصود
+            print("🛑 البوت وقف بشكل طبيعي.")
+            break
+        except KeyboardInterrupt:
+            print("🛑 تم إيقاف البوت يدويًا (Ctrl+C).")
+            break
+        except Exception as e:
+            attempt += 1
+            wait_time = min(30 * attempt, 300)  # يزيد وقت الانتظار تدريجيًا لحد 5 دقايق
+            print(f"⚠️ انقطع الاتصال بالبوت (محاولة رقم {attempt}): {e}")
+            print(f"🔁 هيحاول يعيد الاتصال بعد {wait_time} ثانية...")
+            time.sleep(wait_time)
+
+run_with_auto_reconnect()
